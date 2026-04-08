@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from "react";
 import { DrawIoEmbed } from 'react-drawio';
-import { Send, ChevronRight, ChevronLeft, User, Bot, PlusCircle, LogOut } from 'lucide-react';
+import { Send, ChevronRight, ChevronLeft, User, Bot, LogOut, Trash2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { cookieUtils } from '../src/utils/cookie';
 import { agentService } from '../src/api/agent';
@@ -14,21 +14,143 @@ interface Message {
   content: string;
 }
 
+interface Conversation {
+  id: string;
+  title: string;
+  agentId: string;
+  sessionId: string;
+  messages: Message[];
+  drawioXml: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface ConversationStorage {
+  v: 1;
+  userId: string;
+  activeId: string;
+  conversations: Conversation[];
+}
+
 export default function Home() {
   const router = useRouter();
   const [isChatOpen, setIsChatOpen] = useState(true);
+  const [isBookmarksOpen, setIsBookmarksOpen] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
   
   const [agentList, setAgentList] = useState<AiAgentConfigResponseDTO[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string>('');
+  const [newConversationAgentId, setNewConversationAgentId] = useState<string>('');
   const [sessionId, setSessionId] = useState<string>('');
   const [userId, setUserId] = useState<string>('');
   
   const [drawioXml, setDrawioXml] = useState<string>('');
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvId, setActiveConvId] = useState<string>('');
 
+  const userIdRef = useRef<string>('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const STORAGE_KEY = 'drawioConversations';
+
+  const persistStorage = (next: ConversationStorage) => {
+    const uid = userIdRef.current;
+    if (!uid) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const updateConversations = (updater: (prev: Conversation[]) => Conversation[], nextActiveId?: string) => {
+    setConversations(prev => {
+      const nextList = updater(prev)
+        .slice()
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      const activeId = nextActiveId ?? activeConvId ?? nextList[0]?.id ?? '';
+      persistStorage({ v: 1, userId: userIdRef.current, activeId, conversations: nextList });
+      return nextList;
+    });
+    if (nextActiveId !== undefined) setActiveConvId(nextActiveId);
+  };
+
+  const ensureConversation = (sid: string, aid: string) => {
+    updateConversations(prev => {
+      if (prev.some(c => c.id === sid)) return prev;
+      const now = Date.now();
+      const conv: Conversation = {
+        id: sid,
+        title: '新对话',
+        agentId: aid,
+        sessionId: sid,
+        messages: [],
+        drawioXml: '',
+        createdAt: now,
+        updatedAt: now
+      };
+      return [conv, ...prev];
+    }, sid);
+  };
+
+  useEffect(() => {
+    if (newConversationAgentId) return;
+    setNewConversationAgentId(selectedAgentId || agentList[0]?.agentId || '');
+  }, [agentList, selectedAgentId, newConversationAgentId]);
+
+  const createConversation = (sid: string, aid: string, initialMessages: Message[]) => {
+    const now = Date.now();
+    const conv: Conversation = {
+      id: sid,
+      title: '新对话',
+      agentId: aid,
+      sessionId: sid,
+      messages: initialMessages,
+      drawioXml: '',
+      createdAt: now,
+      updatedAt: now
+    };
+    updateConversations(prev => {
+      const without = prev.filter(c => c.id !== sid);
+      return [conv, ...without];
+    }, sid);
+    setMessages(conv.messages);
+    setDrawioXml('');
+  };
+
+  const handleSelectConversation = (id: string) => {
+    const conv = conversations.find(c => c.id === id);
+    if (!conv) return;
+    setActiveConvId(id);
+    setSelectedAgentId(conv.agentId);
+    setSessionId(conv.sessionId);
+    setMessages(conv.messages);
+    setDrawioXml(conv.drawioXml);
+    persistStorage({ v: 1, userId: userIdRef.current, activeId: id, conversations });
+  };
+
+  const handleDeleteConversation = (id: string) => {
+    const nextList = conversations
+      .filter(c => c.id !== id)
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const nextActiveId = activeConvId === id ? (nextList[0]?.id ?? '') : activeConvId;
+    setConversations(nextList);
+    setActiveConvId(nextActiveId);
+    persistStorage({ v: 1, userId: userIdRef.current, activeId: nextActiveId, conversations: nextList });
+
+    if (!nextActiveId) {
+      setSessionId('');
+      setMessages([]);
+      setDrawioXml('');
+      return;
+    }
+
+    const nextActive = nextList.find(c => c.id === nextActiveId);
+    if (!nextActive) return;
+    setSelectedAgentId(nextActive.agentId);
+    setSessionId(nextActive.sessionId);
+    setMessages(nextActive.messages);
+    setDrawioXml(nextActive.drawioXml);
+  };
 
   useEffect(() => {
     const session = cookieUtils.getSession();
@@ -38,6 +160,31 @@ export default function Home() {
     }
     const username = session.username;
     setUserId(username);
+    userIdRef.current = username;
+
+    let restored = false;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as ConversationStorage;
+        if (parsed && parsed.v === 1 && parsed.userId === username && Array.isArray(parsed.conversations)) {
+          const list = parsed.conversations.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+          setConversations(list);
+          const activeId = parsed.activeId || list[0]?.id || '';
+          if (activeId) {
+            const active = list.find(c => c.id === activeId) || list[0];
+            if (active) {
+              setActiveConvId(active.id);
+              setSelectedAgentId(active.agentId);
+              setSessionId(active.sessionId);
+              setMessages(active.messages);
+              setDrawioXml(active.drawioXml);
+              restored = true;
+            }
+          }
+        }
+      }
+    } catch {}
 
     const init = async () => {
       try {
@@ -45,14 +192,14 @@ export default function Home() {
         if (res.code === '0000' && res.data && res.data.length > 0) {
           setAgentList(res.data);
           const firstAgentId = res.data[0].agentId;
-          setSelectedAgentId(firstAgentId);
-          // 在此处直接调用避免依赖问题
-          if (!sessionId) {
+          setSelectedAgentId(prev => prev || firstAgentId);
+          if (!restored && !sessionId) {
             try {
               const sessionRes = await agentService.createSession({ agentId: firstAgentId, userId: username });
               if (sessionRes.code === '0000' && sessionRes.data) {
-                setSessionId(sessionRes.data.sessionId);
-                setMessages([{
+                const sid = sessionRes.data.sessionId;
+                setSessionId(sid);
+                createConversation(sid, firstAgentId, [{
                   id: Date.now().toString(),
                   role: 'agent',
                   content: '已为您创建新会话，请问有什么可以帮您？'
@@ -76,8 +223,9 @@ export default function Home() {
     try {
       const res = await agentService.createSession({ agentId, userId: uid });
       if (res.code === '0000' && res.data) {
-        setSessionId(res.data.sessionId);
-        setMessages([{
+        const sid = res.data.sessionId;
+        setSessionId(sid);
+        createConversation(sid, agentId, [{
           id: Date.now().toString(),
           role: 'agent',
           content: '已为您创建新会话，请问有什么可以帮您？'
@@ -104,17 +252,32 @@ export default function Home() {
     }
     
     let currentSessionId = sessionId;
+    let createdNewSession = false;
     if (!currentSessionId) {
       try {
         const res = await agentService.createSession({ agentId: selectedAgentId, userId });
         if (res.code === '0000' && res.data) {
           currentSessionId = res.data.sessionId;
           setSessionId(currentSessionId);
+          createdNewSession = true;
         }
       } catch (e) {
         console.error('创建会话失败', e);
         return;
       }
+    }
+
+    if (createdNewSession) {
+      createConversation(currentSessionId, selectedAgentId, [{
+        id: Date.now().toString(),
+        role: 'agent',
+        content: '已为您创建新会话，请问有什么可以帮您？'
+      }]);
+    } else {
+      if (!activeConvId) {
+        setActiveConvId(currentSessionId);
+      }
+      ensureConversation(currentSessionId, selectedAgentId);
     }
 
     const userText = inputValue;
@@ -123,6 +286,11 @@ export default function Home() {
 
     const userMsg: Message = { id: Date.now().toString(), role: 'user', content: userText };
     setMessages(prev => [...prev, userMsg]);
+    updateConversations(prev => prev.map(c => {
+      if (c.id !== currentSessionId) return c;
+      const nextTitle = c.title === '新对话' ? userText.slice(0, 30) : c.title;
+      return { ...c, title: nextTitle, messages: [...c.messages, userMsg], updatedAt: Date.now() };
+    }), currentSessionId);
 
     const botMsgId = (Date.now() + 1).toString();
     setMessages(prev => [...prev, { id: botMsgId, role: 'agent', content: '正在思考...' }]);
@@ -171,6 +339,11 @@ export default function Home() {
           setMessages(prev => prev.map(msg =>
             msg.id === botMsgId ? { ...msg, content: '为您绘制的图表如下：' } : msg
           ));
+          updateConversations(prev => prev.map(c => {
+            if (c.id !== currentSessionId) return c;
+            const agentMsg: Message = { id: botMsgId, role: 'agent', content: '为您绘制的图表如下：' };
+            return { ...c, messages: [...c.messages, agentMsg], drawioXml: finalContent, updatedAt: Date.now() };
+          }), currentSessionId);
         } else {
           // 兜底：如果 JSON 损坏，或者模型没有按要求返回 JSON，尝试直接从字符串里暴力提取 XML
           const xmlMatchFallback = finalContent.replace(/\\"/g, '"').replace(/\\n/g, '\n').match(/(<mxfile[\s\S]*?<\/mxfile>|<mxGraphModel[\s\S]*?<\/mxGraphModel>)/);
@@ -182,22 +355,42 @@ export default function Home() {
             setMessages(prev => prev.map(msg =>
               msg.id === botMsgId ? { ...msg, content: textMsg } : msg
             ));
+            updateConversations(prev => prev.map(c => {
+              if (c.id !== currentSessionId) return c;
+              const agentMsg: Message = { id: botMsgId, role: 'agent', content: textMsg };
+              return { ...c, messages: [...c.messages, agentMsg], drawioXml: xmlMatchFallback[1], updatedAt: Date.now() };
+            }), currentSessionId);
           } else {
             setMessages(prev => prev.map(msg =>
               msg.id === botMsgId ? { ...msg, content: finalContent } : msg
             ));
+            updateConversations(prev => prev.map(c => {
+              if (c.id !== currentSessionId) return c;
+              const agentMsg: Message = { id: botMsgId, role: 'agent', content: finalContent };
+              return { ...c, messages: [...c.messages, agentMsg], updatedAt: Date.now() };
+            }), currentSessionId);
           }
         }
       } else {
         setMessages(prev => prev.map(msg => 
           msg.id === botMsgId ? { ...msg, content: res.info || '无返回内容' } : msg
         ));
+        updateConversations(prev => prev.map(c => {
+          if (c.id !== currentSessionId) return c;
+          const agentMsg: Message = { id: botMsgId, role: 'agent', content: res.info || '无返回内容' };
+          return { ...c, messages: [...c.messages, agentMsg], updatedAt: Date.now() };
+        }), currentSessionId);
       }
     } catch (error) {
       console.error("Chat Error", error);
       setMessages(prev => prev.map(msg => 
         msg.id === botMsgId ? { ...msg, content: '连接异常，请重试' } : msg
       ));
+      updateConversations(prev => prev.map(c => {
+        if (c.id !== currentSessionId) return c;
+        const agentMsg: Message = { id: botMsgId, role: 'agent', content: '连接异常，请重试' };
+        return { ...c, messages: [...c.messages, agentMsg], updatedAt: Date.now() };
+      }), currentSessionId);
     } finally {
       setIsSending(false);
     }
@@ -216,7 +409,69 @@ export default function Home() {
 
   return (
     <div className="flex h-screen w-full bg-zinc-50 font-sans overflow-hidden">
-      
+      <aside className={`relative h-full border-r border-gray-200 bg-white shadow-sm transition-all duration-300 ease-in-out flex flex-col ${isBookmarksOpen ? 'w-64' : 'w-0'}`}>
+        <button
+          onClick={() => setIsBookmarksOpen(!isBookmarksOpen)}
+          className="absolute -right-8 top-1/2 -translate-y-1/2 w-8 h-16 bg-white border border-l-0 border-gray-200 rounded-r-lg flex items-center justify-center cursor-pointer hover:bg-gray-50 shadow-[2px_0_5px_rgba(0,0,0,0.05)] z-10"
+          title={isBookmarksOpen ? "收起书签" : "展开书签"}
+        >
+          {isBookmarksOpen ? <ChevronLeft size={20} className="text-gray-500" /> : <ChevronRight size={20} className="text-gray-500" />}
+        </button>
+
+        <div className={`flex flex-col h-full w-64 ${isBookmarksOpen ? 'opacity-100' : 'opacity-0 overflow-hidden'}`}>
+          <div className="h-14 border-b border-gray-200 flex items-center px-4 bg-gray-50 flex-shrink-0">
+            <h2 className="font-semibold text-gray-700">对话书签</h2>
+          </div>
+          <div className="p-3">
+            <select
+              value={newConversationAgentId}
+              onChange={(e) => setNewConversationAgentId(e.target.value)}
+              className="w-full p-2 mb-2 border border-gray-300 rounded-md text-sm outline-none focus:border-blue-500 bg-white"
+              disabled={agentList.length === 0}
+            >
+              {agentList.length === 0 ? (
+                <option value="">暂无智能体</option>
+              ) : (
+                agentList.map(agent => (
+                  <option key={agent.agentId} value={agent.agentId}>{agent.agentName}</option>
+                ))
+              )}
+            </select>
+            <button
+              onClick={() => handleCreateSession(newConversationAgentId, userId)}
+              className="w-full py-2 bg-blue-600 text-white rounded-md text-sm hover:bg-blue-700 disabled:bg-gray-300"
+              disabled={!newConversationAgentId}
+            >
+              新建对话
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            {conversations.map(conv => (
+              <div
+                key={conv.id}
+                className={`px-3 py-2 border-b border-gray-100 flex items-center justify-between cursor-pointer ${activeConvId === conv.id ? 'bg-blue-50' : 'bg-white'}`}
+                onClick={() => handleSelectConversation(conv.id)}
+              >
+                <div className="flex-1 pr-2 min-w-0">
+                  <div className="text-sm font-medium text-gray-800 truncate">{conv.title || '未命名对话'}</div>
+                  <div className="text-xs text-gray-400 truncate">{conv.sessionId}</div>
+                </div>
+                <button
+                  className="text-gray-400 hover:text-red-500 p-1"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDeleteConversation(conv.id);
+                  }}
+                  title="删除"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </aside>
+
       {/* 左侧主画板区域 */}
       <main className={`flex flex-col flex-1 transition-all duration-300 ease-in-out h-full`}>
         <div className="w-full h-full p-4">
@@ -260,26 +515,6 @@ export default function Home() {
               </div>
               <button onClick={handleLogout} className="text-gray-500 hover:text-red-500 transition-colors" title="退出登录">
                 <LogOut size={18} />
-              </button>
-            </div>
-            <div className="px-4 pb-3 flex flex-col gap-2">
-              <select 
-                value={selectedAgentId} 
-                onChange={(e) => {
-                  setSelectedAgentId(e.target.value);
-                  handleCreateSession(e.target.value, userId);
-                }}
-                className="w-full p-2 border border-gray-300 rounded-md text-sm outline-none focus:border-blue-500"
-              >
-                {agentList.map(agent => (
-                  <option key={agent.agentId} value={agent.agentId}>{agent.agentName}</option>
-                ))}
-              </select>
-              <button 
-                onClick={() => handleCreateSession(selectedAgentId, userId)}
-                className="flex items-center justify-center gap-1 w-full py-2 bg-white border border-gray-300 rounded-md text-sm text-gray-600 hover:bg-gray-50 transition-colors"
-              >
-                <PlusCircle size={14} /> 发起新对话
               </button>
             </div>
           </div>
