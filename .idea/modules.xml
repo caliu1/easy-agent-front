@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/agent-scaffold-draw-io-front.iml" filepath="$PROJECT_DIR$/agent-scaffold-draw-io-front.iml" />
+      <module fileurl="file://$PROJECT_DIR$/easy-agent-front.iml" filepath="$PROJECT_DIR$/easy-agent-front.iml" />
     </modules>
   </component>
 </project>
