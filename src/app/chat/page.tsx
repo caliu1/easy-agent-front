@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { DrawIoEmbed } from "react-drawio";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Bot, ChevronLeft, ChevronRight, Home, LogOut, Send, Settings, Trash2, User } from "lucide-react";
@@ -40,6 +40,14 @@ const SUCCESS_CODE = "0000";
 const STORAGE_KEY = "drawioConversations";
 const CJK_REGEX = /[\u4E00-\u9FFF]/;
 const UNICODE_ESCAPE_REGEX = /\\u[0-9a-fA-F]{4}/;
+const DRAWIO_AGENT_NAME_REGEX = /draw\s*\.?\s*io/i;
+const DRAWIO_AGENT_ID_FALLBACK = new Set(["100120"]);
+
+const isDrawioAgent = (agent?: Pick<AiAgentConfigResponseDTO, "agentId" | "agentName" | "agentDesc">) => {
+  if (!agent) return false;
+  if (DRAWIO_AGENT_ID_FALLBACK.has(agent.agentId)) return true;
+  return DRAWIO_AGENT_NAME_REGEX.test(`${agent.agentName ?? ""} ${agent.agentDesc ?? ""}`);
+};
 
 const decodeUnicodeEscapes = (value: string): string => {
   return value.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => {
@@ -136,7 +144,7 @@ const buildThoughtPreview = (events: ThoughtEvent[]): string => {
   return lines.slice(-3).join("\n");
 };
 
-export default function HomePage() {
+function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const preferredAgentId = searchParams.get("agentId")?.trim() ?? "";
@@ -147,7 +155,6 @@ export default function HomePage() {
   const [isBookmarksOpen, setIsBookmarksOpen] = useState(true);
   const [agentList, setAgentList] = useState<AiAgentConfigResponseDTO[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
-  const [newConversationAgentId, setNewConversationAgentId] = useState("");
   const [userId, setUserId] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [activeConvId, setActiveConvId] = useState("");
@@ -164,6 +171,50 @@ export default function HomePage() {
       return acc;
     }, {});
   }, [agentList]);
+
+  const drawioAgentIdSet = useMemo(() => {
+    const set = new Set<string>();
+    agentList.forEach((agent) => {
+      if (isDrawioAgent(agent)) {
+        set.add(agent.agentId);
+      }
+    });
+    return set;
+  }, [agentList]);
+
+  const activeConversation = useMemo(() => {
+    return conversations.find((c) => c.id === activeConvId);
+  }, [conversations, activeConvId]);
+
+  const isDrawioSession = useMemo(() => {
+    const currentAgentId = activeConversation?.agentId || selectedAgentId;
+    if (!currentAgentId) return false;
+    return drawioAgentIdSet.has(currentAgentId);
+  }, [activeConversation, selectedAgentId, drawioAgentIdSet]);
+
+  const visibleConversations = useMemo(() => {
+    if (!selectedAgentId) return conversations;
+    return conversations.filter((conversation) => conversation.agentId === selectedAgentId);
+  }, [conversations, selectedAgentId]);
+
+  const defaultConversationAgentId = useMemo(() => {
+    const availableAgentIds = new Set(agentList.map((agent) => agent.agentId));
+
+    const fromActiveConversation = activeConversation?.agentId ?? "";
+    if (fromActiveConversation && availableAgentIds.has(fromActiveConversation)) {
+      return fromActiveConversation;
+    }
+
+    if (selectedAgentId && availableAgentIds.has(selectedAgentId)) {
+      return selectedAgentId;
+    }
+
+    if (preferredAgentId && availableAgentIds.has(preferredAgentId)) {
+      return preferredAgentId;
+    }
+
+    return agentList[0]?.agentId ?? "";
+  }, [agentList, activeConversation, preferredAgentId, selectedAgentId]);
 
   const normalizeConversations = (rawConversations: Conversation[]): Conversation[] => {
     return rawConversations.map((conversation) => ({
@@ -555,8 +606,8 @@ export default function HomePage() {
   };
 
   const handleCreateNewConversation = async () => {
-    if (!newConversationAgentId || !userId) return;
-    await createConversation(newConversationAgentId, userId);
+    if (!defaultConversationAgentId || !userId) return;
+    await createConversation(defaultConversationAgentId, userId);
   };
 
   const handleSelectConversation = (id: string) => {
@@ -572,7 +623,10 @@ export default function HomePage() {
 
   const handleDeleteConversation = (id: string) => {
     const next = conversations.filter((c) => c.id !== id);
-    const nextActive = activeConvId === id ? next[0]?.id ?? "" : activeConvId;
+    const nextVisible = selectedAgentId
+      ? next.filter((c) => c.agentId === selectedAgentId)
+      : next;
+    const nextActive = activeConvId === id ? nextVisible[0]?.id ?? "" : activeConvId;
     setConversations(next);
     setActiveConvId(nextActive);
     persistConversations(next, nextActive, userId);
@@ -639,7 +693,6 @@ export default function HomePage() {
         ? preferredAgentId
         : availableAgents[0].agentId;
       setSelectedAgentId(preferredAgent);
-      setNewConversationAgentId(preferredAgent);
 
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
@@ -652,11 +705,30 @@ export default function HomePage() {
           if (parsed.userId === uid && Array.isArray(parsed.conversations) && parsed.conversations.length > 0) {
             const normalizedConversations = normalizeConversations(parsed.conversations);
             setConversations(normalizedConversations);
-            const preferredConversation = preferredAgent
-              ? normalizedConversations.find((c) => c.agentId === preferredAgent)
-              : null;
+
+            if (preferredAgent) {
+              const sameAgentConversations = normalizedConversations.filter((c) => c.agentId === preferredAgent);
+              if (sameAgentConversations.length === 0) {
+                setActiveConvId("");
+                setSessionId("");
+                setMessages([]);
+                setDrawioXml("");
+                persistConversations(normalizedConversations, "", uid);
+                return;
+              }
+
+              const active =
+                sameAgentConversations.find((c) => c.id === parsed.activeId) ??
+                sameAgentConversations[0];
+              setActiveConvId(active.id);
+              setSessionId(active.sessionId);
+              setSelectedAgentId(active.agentId);
+              setMessages(active.messages);
+              setDrawioXml(active.drawioXml);
+              return;
+            }
+
             const active =
-              preferredConversation ??
               normalizedConversations.find((c) => c.id === parsed.activeId) ??
               normalizedConversations[0];
             setActiveConvId(active.id);
@@ -706,17 +778,6 @@ export default function HomePage() {
           </div>
 
           <div className="p-3">
-            <select
-              className="mb-2 w-full rounded-md border border-gray-300 p-2 text-sm"
-              value={newConversationAgentId}
-              onChange={(e) => setNewConversationAgentId(e.target.value)}
-            >
-              {agentList.map((a) => (
-                <option key={a.agentId} value={a.agentId}>
-                  {a.agentName}
-                </option>
-              ))}
-            </select>
             <button
               className="w-full rounded-md bg-blue-600 py-2 text-sm text-white hover:bg-blue-700"
               onClick={handleCreateNewConversation}
@@ -726,7 +787,7 @@ export default function HomePage() {
           </div>
 
           <div className="flex-1 overflow-y-auto">
-            {conversations.map((conv) => (
+            {visibleConversations.map((conv) => (
               <div
                 key={conv.id}
                 onClick={() => handleSelectConversation(conv.id)}
@@ -747,20 +808,25 @@ export default function HomePage() {
                 </button>
               </div>
             ))}
+            {visibleConversations.length === 0 ? (
+              <div className="px-3 py-6 text-center text-xs text-gray-400">当前Agent暂无会话</div>
+            ) : null}
           </div>
         </div>
       </aside>
 
-      <main className="flex h-full flex-1 flex-col">
-        <div className="h-full w-full p-4">
-          <div className="h-full w-full overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
-            <DrawIoEmbed urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }} xml={drawioXml} />
+      {isDrawioSession ? (
+        <main className="flex h-full flex-1 flex-col">
+          <div className="h-full w-full p-4">
+            <div className="h-full w-full overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
+              <DrawIoEmbed urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }} xml={drawioXml} />
+            </div>
           </div>
-        </div>
-      </main>
+        </main>
+      ) : null}
 
       <div
-        className={`relative h-full border-l border-gray-200 bg-white shadow-xl transition-all duration-300 ${isChatOpen ? "w-96" : "w-0"}`}
+        className={`relative h-full border-l border-gray-200 bg-white shadow-xl transition-all duration-300 ${isChatOpen ? (isDrawioSession ? "w-96" : "flex-1") : "w-0"}`}
       >
         <button
           onClick={() => setIsChatOpen(!isChatOpen)}
@@ -769,7 +835,7 @@ export default function HomePage() {
           {isChatOpen ? <ChevronRight size={20} /> : <ChevronLeft size={20} />}
         </button>
 
-        <div className={`flex h-full w-96 flex-col ${isChatOpen ? "opacity-100" : "overflow-hidden opacity-0"}`}>
+        <div className={`flex h-full ${isDrawioSession ? "w-96" : "w-full"} flex-col ${isChatOpen ? "opacity-100" : "overflow-hidden opacity-0"}`}>
           <div className="border-b border-gray-200 bg-gray-50">
             <div className="flex h-14 items-center justify-between px-4">
               <div className="flex items-center text-gray-700">
@@ -881,4 +947,16 @@ export default function HomePage() {
   );
 }
 
-
+export default function HomePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex h-screen w-full items-center justify-center bg-zinc-50 text-zinc-500">
+          Loading chat...
+        </div>
+      }
+    >
+      <HomePageContent />
+    </Suspense>
+  );
+}

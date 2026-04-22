@@ -7,6 +7,7 @@ import type {
   AgentConfigPageResponseDTO,
   AgentConfigPublishRequestDTO,
   AgentConfigRollbackRequestDTO,
+  AgentConfigSubscribeRequestDTO,
   AgentConfigSummaryResponseDTO,
   AgentConfigUpsertRequestDTO,
   AiAgentConfigResponseDTO,
@@ -16,6 +17,9 @@ import type {
   ChatStreamEventResponseDTO,
   CreateSessionRequestDTO,
   CreateSessionResponseDTO,
+  UserAuthResponseDTO,
+  UserLoginRequestDTO,
+  UserRegisterRequestDTO,
 } from "@/types/api";
 
 async function request<T>(url: string, init?: RequestInit): Promise<ApiResponse<T>> {
@@ -39,6 +43,20 @@ export const agentService = {
   queryAiAgentConfigList() {
     return request<AiAgentConfigResponseDTO[]>(buildApiUrl("/query_ai_agent_config_list"), {
       method: "GET",
+    });
+  },
+
+  userRegister(payload: UserRegisterRequestDTO) {
+    return request<UserAuthResponseDTO>(buildApiUrl("/user_register"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  userLogin(payload: UserLoginRequestDTO) {
+    return request<UserAuthResponseDTO>(buildApiUrl("/user_login"), {
+      method: "POST",
+      body: JSON.stringify(payload),
     });
   },
 
@@ -93,6 +111,15 @@ export const agentService = {
     });
   },
 
+  queryMySubscribedAgentConfigList(userId: string) {
+    return request<AgentConfigSummaryResponseDTO[]>(
+      buildApiUrl(`/agent_config_my_subscribe_list?userId=${encodeURIComponent(userId)}`),
+      {
+        method: "GET",
+      },
+    );
+  },
+
   queryAgentConfigPage(payload: AgentConfigPageQueryRequestDTO) {
     return request<AgentConfigPageResponseDTO>(buildApiUrl("/agent_config_page_query"), {
       method: "POST",
@@ -130,6 +157,20 @@ export const agentService = {
 
   unpublishAgentFromPlaza(payload: AgentConfigOfflineRequestDTO) {
     return request<AgentConfigDetailResponseDTO>(buildApiUrl("/agent_config_plaza_offline"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  subscribeAgentConfig(payload: AgentConfigSubscribeRequestDTO) {
+    return request<boolean>(buildApiUrl("/agent_config_subscribe"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  unsubscribeAgentConfig(payload: AgentConfigSubscribeRequestDTO) {
+    return request<boolean>(buildApiUrl("/agent_config_unsubscribe"), {
       method: "POST",
       body: JSON.stringify(payload),
     });

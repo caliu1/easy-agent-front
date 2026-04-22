@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Bot, Ellipsis, Loader2, LogOut, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
+import { Bot, Ellipsis, Heart, Loader2, LogOut, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
 import type { AgentConfigSummaryResponseDTO } from "@/types/api";
@@ -17,7 +17,7 @@ type Notice = {
   text: string;
 };
 
-type ViewTab = "my" | "plaza";
+type ViewTab = "my" | "subscribed" | "plaza";
 
 const formatIdLabel = (agentId: string) => {
   if (!agentId) return "-";
@@ -46,6 +46,7 @@ export default function MyAgentPage() {
   const [activeTab, setActiveTab] = useState<ViewTab>("my");
   const [myAgents, setMyAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
   const [plazaAgents, setPlazaAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
+  const [subscribedAgents, setSubscribedAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
 
   const avatarPalette = useMemo(
     () => [
@@ -98,9 +99,10 @@ export default function MyAgentPage() {
     async (currentUserId: string) => {
       setLoading(true);
       try {
-        const [myResponse, plazaResponse] = await Promise.all([
+        const [myResponse, plazaResponse, subscribeResponse] = await Promise.all([
           agentService.queryMyAgentConfigList(currentUserId),
           agentService.queryAgentPlazaList(),
+          agentService.queryMySubscribedAgentConfigList(currentUserId),
         ]);
 
         if (myResponse.code !== SUCCESS_CODE) {
@@ -109,9 +111,13 @@ export default function MyAgentPage() {
         if (plazaResponse.code !== SUCCESS_CODE) {
           throw new Error(plazaResponse.info || "加载Agent广场失败");
         }
+        if (subscribeResponse.code !== SUCCESS_CODE) {
+          throw new Error(subscribeResponse.info || "加载我的订阅失败");
+        }
 
         setMyAgents(myResponse.data ?? []);
         setPlazaAgents(plazaResponse.data ?? []);
+        setSubscribedAgents(subscribeResponse.data ?? []);
       } catch (error) {
         console.error(error);
         showNotice("error", error instanceof Error ? error.message : "加载Agent列表失败");
@@ -136,12 +142,44 @@ export default function MyAgentPage() {
     await loadAgents(userId);
   }, [loadAgents, userId]);
 
+  const subscribedAgentIdSet = useMemo(() => {
+    return new Set(subscribedAgents.map((item) => item.agentId));
+  }, [subscribedAgents]);
+
   const handleOpenChat = (agent: AgentConfigSummaryResponseDTO) => {
     if (!canOpenChat(agent)) {
       showNotice("info", "该Agent尚未发布运行，暂不可进入会话");
       return;
     }
     router.push(`/chat?agentId=${encodeURIComponent(agent.agentId)}`);
+  };
+
+  const handleToggleSubscribe = async (agent: AgentConfigSummaryResponseDTO) => {
+    if (!userId) return;
+    const isSubscribed = subscribedAgentIdSet.has(agent.agentId);
+    await withBusyAgent(agent.agentId, async () => {
+      try {
+        const response = isSubscribed
+          ? await agentService.unsubscribeAgentConfig({
+              userId,
+              agentId: agent.agentId,
+            })
+          : await agentService.subscribeAgentConfig({
+              userId,
+              agentId: agent.agentId,
+            });
+
+        if (response.code !== SUCCESS_CODE) {
+          throw new Error(response.info || (isSubscribed ? "取消订阅失败" : "订阅失败"));
+        }
+
+        showNotice("success", isSubscribed ? `已取消订阅：${agent.agentName}` : `已订阅：${agent.agentName}`);
+        await refreshAll();
+      } catch (error) {
+        console.error(error);
+        showNotice("error", error instanceof Error ? error.message : isSubscribed ? "取消订阅失败" : "订阅失败");
+      }
+    });
   };
 
   const handleQuickUpdateAgent = async (agent: AgentConfigSummaryResponseDTO) => {
@@ -281,6 +319,7 @@ export default function MyAgentPage() {
         // 删除成功后先本地移除，避免用户看到“已删除”但卡片仍停留在页面上。
         setMyAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
         setPlazaAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
+        setSubscribedAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
         setOpenMenuAgentId((prev) => (prev === agent.agentId ? "" : prev));
         showNotice("success", `已删除Agent：${agent.agentName}`);
       } catch (error) {
@@ -362,12 +401,19 @@ export default function MyAgentPage() {
     setOpenMenuAgentId("");
   }, [activeTab]);
 
-  const renderAgentCard = (agent: AgentConfigSummaryResponseDTO, index: number, allowManage: boolean) => {
+  const renderAgentCard = (
+    agent: AgentConfigSummaryResponseDTO,
+    index: number,
+    options?: { allowManage?: boolean; showSubscribeAction?: boolean },
+  ) => {
+    const allowManage = options?.allowManage ?? false;
+    const showSubscribeAction = options?.showSubscribeAction ?? false;
     const gradient = avatarPalette[index % avatarPalette.length];
     const initial = (agent.agentName?.trim()?.[0] || "A").toUpperCase();
     const isMenuOpen = openMenuAgentId === agent.agentId;
     const isBusy = busyAgentId === agent.agentId;
     const inPlaza = agent.plazaStatus === PLAZA_ON;
+    const isSubscribed = subscribedAgentIdSet.has(agent.agentId);
 
     return (
       <article
@@ -399,6 +445,27 @@ export default function MyAgentPage() {
           <p className="mt-3 line-clamp-2 text-sm leading-6 text-zinc-500">{agent.agentDesc || "暂无描述"}</p>
           <p className="mt-1 text-xs text-zinc-400">作者：{agent.ownerUserId || userId || "admin"}</p>
         </button>
+
+        {showSubscribeAction ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              void handleToggleSubscribe(agent);
+            }}
+            disabled={isBusy}
+            className={`absolute bottom-4 right-4 inline-flex h-9 w-9 items-center justify-center rounded-full border shadow-sm transition ${
+              isSubscribed
+                ? "border-rose-200 bg-rose-50 text-rose-500 hover:bg-rose-100"
+                : "border-zinc-200 bg-white text-zinc-400 hover:bg-zinc-100 hover:text-rose-400"
+            } ${isBusy ? "cursor-not-allowed opacity-60" : ""}`}
+            aria-label={isSubscribed ? "unsubscribe-agent" : "subscribe-agent"}
+            title={isSubscribed ? "取消订阅" : "订阅Agent"}
+          >
+            {isBusy ? <Loader2 size={16} className="animate-spin" /> : <Heart size={16} fill={isSubscribed ? "currentColor" : "none"} />}
+          </button>
+        ) : null}
 
         {allowManage ? (
           <div className="absolute bottom-4 right-4" data-agent-menu-root="true">
@@ -546,6 +613,15 @@ export default function MyAgentPage() {
               </button>
               <button
                 type="button"
+                onClick={() => setActiveTab("subscribed")}
+                className={`rounded-xl px-5 py-2 text-sm font-medium transition ${
+                  activeTab === "subscribed" ? "bg-blue-600 text-white" : "text-zinc-600 hover:bg-zinc-100"
+                }`}
+              >
+                我的订阅
+              </button>
+              <button
+                type="button"
                 onClick={() => setActiveTab("plaza")}
                 className={`rounded-xl px-5 py-2 text-sm font-medium transition ${
                   activeTab === "plaza" ? "bg-blue-600 text-white" : "text-zinc-600 hover:bg-zinc-100"
@@ -589,7 +665,7 @@ export default function MyAgentPage() {
                 <p className="mt-3 text-sm leading-6 text-zinc-500">点击卡片进入新建页面，创建后可按需发布到广场。</p>
               </button>
 
-              {myAgents.map((agent, index) => renderAgentCard(agent, index, true))}
+              {myAgents.map((agent, index) => renderAgentCard(agent, index, { allowManage: true }))}
 
               {!myAgents.length ? (
                 <div className="col-span-full rounded-2xl border border-zinc-200 bg-white/70 px-5 py-10 text-center text-zinc-500">
@@ -598,11 +674,26 @@ export default function MyAgentPage() {
               ) : null}
             </div>
           </section>
+        ) : activeTab === "subscribed" ? (
+          <section>
+            <p className="mb-5 text-3xl font-medium text-zinc-700">我订阅的Agent</p>
+            <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
+              {subscribedAgents.map((agent, index) =>
+                renderAgentCard(agent, index, { showSubscribeAction: true }),
+              )}
+
+              {!subscribedAgents.length ? (
+                <div className="col-span-full rounded-2xl border border-zinc-200 bg-white/70 px-5 py-10 text-center text-zinc-500">
+                  暂无订阅，去 Agent 广场点亮右下角爱心即可收藏。
+                </div>
+              ) : null}
+            </div>
+          </section>
         ) : (
           <section>
             <p className="mb-5 text-3xl font-medium text-zinc-700">Agent广场</p>
             <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
-              {plazaAgents.map((agent, index) => renderAgentCard(agent, index, false))}
+              {plazaAgents.map((agent, index) => renderAgentCard(agent, index, { showSubscribeAction: true }))}
 
               {!plazaAgents.length ? (
                 <div className="col-span-full rounded-2xl border border-zinc-200 bg-white/70 px-5 py-10 text-center text-zinc-500">

@@ -15,6 +15,23 @@ export interface CreateSessionRequestDTO {
   userId: string;
 }
 
+export interface UserRegisterRequestDTO {
+  userId: string;
+  password: string;
+  nickname?: string;
+}
+
+export interface UserLoginRequestDTO {
+  userId: string;
+  password: string;
+}
+
+export interface UserAuthResponseDTO {
+  userId: string;
+  nickname: string;
+  token: string;
+}
+
 export interface CreateSessionResponseDTO {
   sessionId: string;
 }
@@ -58,6 +75,11 @@ export interface AgentConfigUpsertRequestDTO {
 export interface AgentConfigDeleteRequestDTO {
   agentId: string;
   operator?: string;
+}
+
+export interface AgentConfigSubscribeRequestDTO {
+  userId: string;
+  agentId: string;
 }
 
 export interface AgentConfigPublishRequestDTO {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, Loader2, RefreshCw, Save, Search, Trash2, UploadCloud } from "lucide-react";
 import { agentService } from "@/api/agent";
@@ -29,7 +29,7 @@ const EMPTY_FORM: AgentConfigUpsertRequestDTO = {
   operator: "",
 };
 
-export default function AgentAdminPage() {
+function AgentAdminPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const preferredAgentId = searchParams.get("agentId")?.trim() ?? "";
@@ -767,5 +767,20 @@ export default function AgentAdminPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function AgentAdminPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center bg-zinc-50 text-zinc-500">
+          <Loader2 size={18} className="mr-2 animate-spin" />
+          Loading...
+        </div>
+      }
+    >
+      <AgentAdminPageContent />
+    </Suspense>
   );
 }
