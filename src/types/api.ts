@@ -60,6 +60,28 @@ export interface ChatStreamEventResponseDTO {
   finalResponse?: boolean;
 }
 
+export interface SessionHistorySummaryResponseDTO {
+  sessionId: string;
+  agentId: string;
+  userId: string;
+  sessionTitle: string;
+  latestMessage: string;
+  messageCount: number;
+  totalTokens?: number;
+  createTime?: number;
+  updateTime?: number;
+}
+
+export interface SessionHistoryMessageResponseDTO {
+  id?: number;
+  sessionId: string;
+  agentId: string;
+  userId: string;
+  role: string;
+  content: string;
+  createTime?: number;
+}
+
 export interface AgentConfigUpsertRequestDTO {
   agentId: string;
   appName?: string;

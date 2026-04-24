@@ -6,7 +6,13 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Bot, ChevronLeft, ChevronRight, Home, LogOut, Send, Settings, Trash2, User } from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
-import type { AiAgentConfigResponseDTO, ChatResponseDTO, ChatStreamEventResponseDTO } from "@/types/api";
+import type {
+  AiAgentConfigResponseDTO,
+  ChatResponseDTO,
+  ChatStreamEventResponseDTO,
+  SessionHistoryMessageResponseDTO,
+  SessionHistorySummaryResponseDTO,
+} from "@/types/api";
 
 type Role = "user" | "agent";
 type ThoughtType = "thinking" | "route" | "system";
@@ -31,17 +37,25 @@ interface Conversation {
   title: string;
   sessionId: string;
   agentId: string;
+  totalTokens: number;
   messages: Message[];
   drawioXml: string;
   updatedAt: number;
 }
 
 const SUCCESS_CODE = "0000";
-const STORAGE_KEY = "drawioConversations";
 const CJK_REGEX = /[\u4E00-\u9FFF]/;
 const UNICODE_ESCAPE_REGEX = /\\u[0-9a-fA-F]{4}/;
 const DRAWIO_AGENT_NAME_REGEX = /draw\s*\.?\s*io/i;
 const DRAWIO_AGENT_ID_FALLBACK = new Set(["100120"]);
+const HISTORY_EVENT_MARKER = "[[AGENT_HISTORY_EVENT]]";
+
+interface PersistedHistoryEvent {
+  type: string;
+  agentName: string;
+  content: string;
+  routeTarget?: string;
+}
 
 const isDrawioAgent = (agent?: Pick<AiAgentConfigResponseDTO, "agentId" | "agentName" | "agentDesc">) => {
   if (!agent) return false;
@@ -75,38 +89,6 @@ const normalizePotentialMojibake = (value: string): string => {
 
   const decodedCjkCount = (decoded.match(CJK_REGEX) ?? []).length;
   return decodedCjkCount >= 2 ? decoded : unicodeNormalized;
-};
-
-const normalizeTraceEvents = (events: ThoughtEvent[]): ThoughtEvent[] => {
-  const merged: ThoughtEvent[] = [];
-  for (const event of events) {
-    const normalized: ThoughtEvent = {
-      id: event.id,
-      type: event.type,
-      agentName: normalizePotentialMojibake(event.agentName ?? "System"),
-      content: normalizePotentialMojibake(event.content ?? ""),
-      createdAt: event.createdAt,
-    };
-
-    const last = merged[merged.length - 1];
-    if (
-      normalized.type === "thinking" &&
-      last &&
-      last.type === "thinking" &&
-      last.agentName === normalized.agentName
-    ) {
-      merged[merged.length - 1] = {
-        ...last,
-        content: `${last.content}${normalized.content}`,
-        createdAt: normalized.createdAt,
-      };
-      continue;
-    }
-
-    merged.push(normalized);
-  }
-
-  return merged;
 };
 
 const calcThoughtDurationSeconds = (events: ThoughtEvent[]): number => {
@@ -165,13 +147,6 @@ function HomePageContent() {
   const [isSending, setIsSending] = useState(false);
   const [streamingAgentMessageId, setStreamingAgentMessageId] = useState("");
 
-  const agentNameMap = useMemo(() => {
-    return agentList.reduce<Record<string, string>>((acc, cur) => {
-      acc[cur.agentId] = cur.agentName;
-      return acc;
-    }, {});
-  }, [agentList]);
-
   const drawioAgentIdSet = useMemo(() => {
     const set = new Set<string>();
     agentList.forEach((agent) => {
@@ -216,41 +191,11 @@ function HomePageContent() {
     return agentList[0]?.agentId ?? "";
   }, [agentList, activeConversation, preferredAgentId, selectedAgentId]);
 
-  const normalizeConversations = (rawConversations: Conversation[]): Conversation[] => {
-    return rawConversations.map((conversation) => ({
-      ...conversation,
-      title: normalizePotentialMojibake(conversation.title ?? "New Chat"),
-      messages: Array.isArray(conversation.messages)
-        ? conversation.messages.map((msg) => ({
-            id: msg.id,
-            role: msg.role === "user" ? "user" : "agent",
-            content: normalizePotentialMojibake(msg.content ?? ""),
-            traceEvents: Array.isArray(msg.traceEvents)
-              ? normalizeTraceEvents(msg.traceEvents)
-              : [],
-          }))
-        : [],
-      drawioXml: conversation.drawioXml ?? "",
-    }));
-  };
-
-  const persistConversations = (nextConversations: Conversation[], nextActiveId: string, uid: string) => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        userId: uid,
-        activeId: nextActiveId,
-        conversations: nextConversations,
-      }),
-    );
-  };
-
   const replaceAgentMessage = (
     convId: string,
     messageId: string,
     content: string,
     nextXml?: string,
-    persist = true,
   ) => {
     setMessages((prev) => {
       const existed = prev.some((m) => m.id === messageId);
@@ -276,9 +221,6 @@ function HomePageContent() {
           updatedAt: Date.now(),
         };
       });
-      if (persist) {
-        persistConversations(next, convId, userId);
-      }
       return next;
     });
     if (nextXml !== undefined) {
@@ -286,10 +228,10 @@ function HomePageContent() {
     }
   };
 
-  const appendAgentMessage = (convId: string, message: Message, persist = true) => {
+  const appendAgentMessage = (convId: string, message: Message) => {
     setMessages((prev) => [...prev, message]);
     setConversations((prev) => {
-      const next = prev.map((c) => {
+      return prev.map((c) => {
         if (c.id !== convId) return c;
         return {
           ...c,
@@ -297,10 +239,6 @@ function HomePageContent() {
           updatedAt: Date.now(),
         };
       });
-      if (persist) {
-        persistConversations(next, convId, userId);
-      }
-      return next;
     });
   };
 
@@ -393,36 +331,239 @@ function HomePageContent() {
     return { type: responseType, content: responseContent };
   };
 
+  const parsePersistedHistoryEvent = (rawContent: string): PersistedHistoryEvent | null => {
+    if (!rawContent.startsWith(HISTORY_EVENT_MARKER)) {
+      return null;
+    }
+
+    const payloadText = rawContent.substring(HISTORY_EVENT_MARKER.length).trim();
+    if (!payloadText) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(payloadText) as {
+        type?: string;
+        agentName?: string;
+        content?: string;
+        routeTarget?: string;
+      };
+
+      return {
+        type: (parsed.type ?? "system").toLowerCase(),
+        agentName: normalizePotentialMojibake(parsed.agentName ?? ""),
+        content: normalizePotentialMojibake(parsed.content ?? ""),
+        routeTarget: normalizePotentialMojibake(parsed.routeTarget ?? ""),
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const mapSessionSummaryToConversation = (item: SessionHistorySummaryResponseDTO): Conversation => {
+    return {
+      id: item.sessionId,
+      title: normalizePotentialMojibake(item.sessionTitle || "New Chat"),
+      sessionId: item.sessionId,
+      agentId: item.agentId,
+      totalTokens: item.totalTokens ?? 0,
+      messages: [],
+      drawioXml: "",
+      updatedAt: item.updateTime ?? item.createTime ?? Date.now(),
+    };
+  };
+
+  const mapSessionMessagesToUI = (items: SessionHistoryMessageResponseDTO[]): { messages: Message[]; drawioXml: string } => {
+    let latestDrawioXml = "";
+    const mapped: Message[] = [];
+    let pendingTraceEvents: ThoughtEvent[] = [];
+
+    items.forEach((item, index) => {
+      const roleLower = item.role?.toLowerCase() ?? "";
+      const rawContent = normalizePotentialMojibake(item.content ?? "");
+      const fallbackId = `${item.createTime ?? Date.now()}-${index}`;
+      const messageId = `${item.id ?? fallbackId}`;
+      const createdAt = item.createTime ?? Date.now();
+
+      if (roleLower === "user") {
+        mapped.push({
+          id: messageId,
+          role: "user",
+          content: rawContent,
+        });
+        return;
+      }
+
+      if (roleLower === "system") {
+        const historyEvent = parsePersistedHistoryEvent(rawContent);
+        if (historyEvent) {
+          if (historyEvent.type === "reply" || historyEvent.type === "final") {
+            const parsed = parseResponse({ content: historyEvent.content });
+            const replayedContent = normalizePotentialMojibake(parsed.content ?? "");
+            if (parsed.type === "drawio" && parsed.xml) {
+              latestDrawioXml = parsed.xml;
+            }
+
+            mapped.push({
+              id: messageId,
+              role: "agent",
+              content: replayedContent,
+              traceEvents: pendingTraceEvents,
+            });
+            pendingTraceEvents = [];
+            return;
+          }
+
+          if (historyEvent.type === "route") {
+            const routeTarget = historyEvent.routeTarget || historyEvent.content || "\u672A\u6307\u5B9A\u5B50 Agent";
+            pendingTraceEvents = [
+              ...pendingTraceEvents,
+              {
+                id: `trace-${messageId}`,
+                type: "route",
+                agentName: historyEvent.agentName || "\u4E3B Agent",
+                content: `\u8FDB\u5165\u4E0B\u4E00\u5904\u7406\u9636\u6BB5\uFF08${routeTarget}\uFF09`,
+                createdAt,
+              },
+            ];
+            return;
+          }
+
+          if (historyEvent.content.trim()) {
+            pendingTraceEvents = [
+              ...pendingTraceEvents,
+              {
+                id: `trace-${messageId}`,
+                type: "thinking",
+                agentName: historyEvent.agentName || "\u5B50 Agent",
+                content: historyEvent.content,
+                createdAt,
+              },
+            ];
+          }
+          return;
+        }
+
+        if (rawContent.trim()) {
+          pendingTraceEvents = [
+            ...pendingTraceEvents,
+            {
+              id: `trace-${messageId}`,
+              type: "system",
+              agentName: "System",
+              content: rawContent,
+              createdAt,
+            },
+          ];
+        }
+        return;
+      }
+
+      const parsed = parseResponse({ content: rawContent });
+      const agentContent = normalizePotentialMojibake(parsed.content ?? "");
+      if (parsed.type === "drawio" && parsed.xml) {
+        latestDrawioXml = parsed.xml;
+      }
+
+      mapped.push({
+        id: messageId,
+        role: "agent",
+        content: agentContent,
+        traceEvents: pendingTraceEvents,
+      });
+      pendingTraceEvents = [];
+    });
+
+    if (pendingTraceEvents.length > 0) {
+      for (let i = mapped.length - 1; i >= 0; i -= 1) {
+        if (mapped[i].role !== "agent") continue;
+        mapped[i] = {
+          ...mapped[i],
+          traceEvents: [...(mapped[i].traceEvents ?? []), ...pendingTraceEvents],
+        };
+        break;
+      }
+    }
+
+    return {
+      messages: mapped,
+      drawioXml: latestDrawioXml,
+    };
+  };
+
+  const loadConversationMessages = async (sid: string) => {
+    const response = await agentService.querySessionMessageList(sid);
+    if (response.code !== SUCCESS_CODE) return;
+
+    const { messages: nextMessages, drawioXml: nextDrawioXml } = mapSessionMessagesToUI(response.data ?? []);
+    setMessages(nextMessages);
+    setDrawioXml(nextDrawioXml);
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === sid
+          ? {
+              ...conversation,
+              messages: nextMessages,
+              drawioXml: nextDrawioXml,
+              updatedAt: Date.now(),
+            }
+          : conversation,
+      ),
+    );
+  };
+
+  const loadSessionHistoryList = async (uid: string, agentId: string, preferredSessionId?: string) => {
+    const response = await agentService.querySessionHistoryList(uid, agentId);
+    if (response.code !== SUCCESS_CODE) return;
+
+    const nextConversations = (response.data ?? []).map(mapSessionSummaryToConversation);
+    setConversations(nextConversations);
+
+    let nextActiveId = "";
+    if (preferredSessionId && nextConversations.some((item) => item.id === preferredSessionId)) {
+      nextActiveId = preferredSessionId;
+    } else {
+      nextActiveId = nextConversations[0]?.id ?? "";
+    }
+
+    setActiveConvId(nextActiveId);
+    setSessionId(nextActiveId);
+    if (!nextActiveId) {
+      setMessages([]);
+      setDrawioXml("");
+      return;
+    }
+
+    const active = nextConversations.find((item) => item.id === nextActiveId);
+    if (active?.agentId) {
+      setSelectedAgentId(active.agentId);
+    }
+    await loadConversationMessages(nextActiveId);
+  };
+
   const createConversation = async (agentId: string, uid: string): Promise<string | null> => {
     const res = await agentService.createSession({ agentId, userId: uid });
     if (res.code !== SUCCESS_CODE || !res.data?.sessionId) return null;
 
     const sid = res.data.sessionId;
     const now = Date.now();
-    const welcomeMsg: Message = {
-      id: `${now}`,
-      role: "agent",
-      content: `New session created. I am ${agentNameMap[agentId] || "Agent"}. How can I help you?`,
-      traceEvents: [],
-    };
     const nextConversation: Conversation = {
       id: sid,
       title: "New Chat",
       sessionId: sid,
       agentId,
-      messages: [welcomeMsg],
+      totalTokens: 0,
+      messages: [],
       drawioXml: "",
       updatedAt: now,
     };
 
-    const nextConversations = [nextConversation, ...conversations.filter((c) => c.id !== sid)];
     setSessionId(sid);
     setActiveConvId(sid);
     setSelectedAgentId(agentId);
-    setMessages(nextConversation.messages);
+    setMessages([]);
     setDrawioXml("");
-    setConversations(nextConversations);
-    persistConversations(nextConversations, sid, uid);
+    setConversations((prev) => [nextConversation, ...prev.filter((item) => item.id !== sid)]);
     return sid;
   };
 
@@ -474,6 +615,7 @@ function HomePageContent() {
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isSending || !selectedAgentId || !userId) return;
 
+    const currentAgentId = selectedAgentId;
     let currentSessionId = sessionId;
     setIsSending(true);
 
@@ -482,7 +624,7 @@ function HomePageContent() {
 
     try {
       if (!currentSessionId) {
-        const created = await createConversation(selectedAgentId, userId);
+        const created = await createConversation(currentAgentId, userId);
         if (!created) {
           setIsSending(false);
           return;
@@ -504,7 +646,7 @@ function HomePageContent() {
 
       setMessages((prev) => [...prev, userMsg, pendingBotMsg]);
       setConversations((prev) => {
-        const next = prev.map((c) => {
+        return prev.map((c) => {
           if (c.id !== currentSessionId) return c;
           return {
             ...c,
@@ -513,8 +655,6 @@ function HomePageContent() {
             updatedAt: Date.now(),
           };
         });
-        persistConversations(next, currentSessionId, userId);
-        return next;
       });
 
       let activeAgentMessageId = botMsgId;
@@ -525,7 +665,7 @@ function HomePageContent() {
 
       await agentService.chatStream(
         {
-          agentId: selectedAgentId,
+          agentId: currentAgentId,
           userId,
           sessionId: currentSessionId,
           message: text,
@@ -545,7 +685,7 @@ function HomePageContent() {
 
           const normalizedReply = normalizePotentialMojibake(activeReplyContent);
           const previewText = normalizedReply.trim() || "Main agent is composing a reply...";
-          replaceAgentMessage(currentSessionId, activeAgentMessageId, previewText, undefined, false);
+          replaceAgentMessage(currentSessionId, activeAgentMessageId, previewText);
 
           if (eventType === "reply") {
             if (streamEvent.partial) {
@@ -558,7 +698,7 @@ function HomePageContent() {
               content: "",
               traceEvents: [],
             };
-            appendAgentMessage(currentSessionId, nextPendingBotMsg, false);
+            appendAgentMessage(currentSessionId, nextPendingBotMsg);
             setStreamingAgentMessageId(nextMsgId);
             activeAgentMessageId = nextMsgId;
             activeReplyContent = "";
@@ -575,10 +715,9 @@ function HomePageContent() {
       if (!sawFinal || !finalContent.trim()) {
         replaceAgentMessage(currentSessionId, activeAgentMessageId, "This round ended without a final main-agent reply. Please retry.");
         setConversations((prev) => {
-          const next = prev.map((c) => (c.id === currentSessionId ? { ...c, updatedAt: Date.now() } : c));
-          persistConversations(next, currentSessionId, userId);
-          return next;
+          return prev.map((c) => (c.id === currentSessionId ? { ...c, updatedAt: Date.now() } : c));
         });
+        await loadSessionHistoryList(userId, currentAgentId, currentSessionId);
         return;
       }
 
@@ -589,14 +728,14 @@ function HomePageContent() {
         replaceAgentMessage(currentSessionId, finalMessageId, parsed.content);
       }
       setConversations((prev) => {
-        const next = prev.map((c) => (c.id === currentSessionId ? { ...c, updatedAt: Date.now() } : c));
-        persistConversations(next, currentSessionId, userId);
-        return next;
+        return prev.map((c) => (c.id === currentSessionId ? { ...c, updatedAt: Date.now() } : c));
       });
+      await loadSessionHistoryList(userId, currentAgentId, currentSessionId);
     } catch (error) {
       console.error(error);
       if (currentSessionId) {
         replaceAgentMessage(currentSessionId, `${Date.now() + 2}`, "Connection error, please retry.");
+        await loadSessionHistoryList(userId, currentAgentId, currentSessionId);
       }
     } finally {
       setIsSending(false);
@@ -607,43 +746,26 @@ function HomePageContent() {
 
   const handleCreateNewConversation = async () => {
     if (!defaultConversationAgentId || !userId) return;
-    await createConversation(defaultConversationAgentId, userId);
+    const created = await createConversation(defaultConversationAgentId, userId);
+    if (created) {
+      await loadSessionHistoryList(userId, defaultConversationAgentId, created);
+    }
   };
 
-  const handleSelectConversation = (id: string) => {
+  const handleSelectConversation = async (id: string) => {
     const current = conversations.find((c) => c.id === id);
     if (!current) return;
     setActiveConvId(current.id);
     setSessionId(current.sessionId);
     setSelectedAgentId(current.agentId);
-    setMessages(current.messages);
-    setDrawioXml(current.drawioXml);
-    persistConversations(conversations, current.id, userId);
+    setMessages(current.messages ?? []);
+    setDrawioXml(current.drawioXml ?? "");
+    await loadConversationMessages(current.sessionId);
   };
 
   const handleDeleteConversation = (id: string) => {
-    const next = conversations.filter((c) => c.id !== id);
-    const nextVisible = selectedAgentId
-      ? next.filter((c) => c.agentId === selectedAgentId)
-      : next;
-    const nextActive = activeConvId === id ? nextVisible[0]?.id ?? "" : activeConvId;
-    setConversations(next);
-    setActiveConvId(nextActive);
-    persistConversations(next, nextActive, userId);
-
-    if (!nextActive) {
-      setSessionId("");
-      setMessages([]);
-      setDrawioXml("");
-      return;
-    }
-
-    const active = next.find((c) => c.id === nextActive);
-    if (!active) return;
-    setSessionId(active.sessionId);
-    setSelectedAgentId(active.agentId);
-    setMessages(active.messages);
-    setDrawioXml(active.drawioXml);
+    if (!id) return;
+    window.alert("当前版本暂不支持删除会话历史。");
   };
 
   const handleLogout = () => {
@@ -693,57 +815,7 @@ function HomePageContent() {
         ? preferredAgentId
         : availableAgents[0].agentId;
       setSelectedAgentId(preferredAgent);
-
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw) as {
-            userId: string;
-            activeId: string;
-            conversations: Conversation[];
-          };
-          if (parsed.userId === uid && Array.isArray(parsed.conversations) && parsed.conversations.length > 0) {
-            const normalizedConversations = normalizeConversations(parsed.conversations);
-            setConversations(normalizedConversations);
-
-            if (preferredAgent) {
-              const sameAgentConversations = normalizedConversations.filter((c) => c.agentId === preferredAgent);
-              if (sameAgentConversations.length === 0) {
-                setActiveConvId("");
-                setSessionId("");
-                setMessages([]);
-                setDrawioXml("");
-                persistConversations(normalizedConversations, "", uid);
-                return;
-              }
-
-              const active =
-                sameAgentConversations.find((c) => c.id === parsed.activeId) ??
-                sameAgentConversations[0];
-              setActiveConvId(active.id);
-              setSessionId(active.sessionId);
-              setSelectedAgentId(active.agentId);
-              setMessages(active.messages);
-              setDrawioXml(active.drawioXml);
-              return;
-            }
-
-            const active =
-              normalizedConversations.find((c) => c.id === parsed.activeId) ??
-              normalizedConversations[0];
-            setActiveConvId(active.id);
-            setSessionId(active.sessionId);
-            setSelectedAgentId(active.agentId);
-            setMessages(active.messages);
-            setDrawioXml(active.drawioXml);
-            return;
-          }
-        }
-      } catch {
-        // ignore local cache parse failures
-      }
-
-      await createConversation(preferredAgent, uid);
+      await loadSessionHistoryList(uid, preferredAgent);
     };
 
     init().catch((e) => console.error("Initialization failed", e));
@@ -796,6 +868,7 @@ function HomePageContent() {
                 <div className="min-w-0 flex-1 pr-2">
                   <div className="truncate text-sm font-medium text-gray-800">{conv.title || "Conversation"}</div>
                   <div className="truncate text-xs text-gray-400">{conv.sessionId}</div>
+                  <div className="truncate text-[11px] text-gray-400">{conv.totalTokens} tokens</div>
                 </div>
                 <button
                   className="p-1 text-gray-400 hover:text-red-500"

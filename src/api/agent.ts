@@ -17,6 +17,8 @@ import type {
   ChatStreamEventResponseDTO,
   CreateSessionRequestDTO,
   CreateSessionResponseDTO,
+  SessionHistoryMessageResponseDTO,
+  SessionHistorySummaryResponseDTO,
   UserAuthResponseDTO,
   UserLoginRequestDTO,
   UserRegisterRequestDTO,
@@ -219,6 +221,29 @@ export const agentService = {
       method: "POST",
       body: JSON.stringify(payload),
     });
+  },
+
+  querySessionHistoryList(userId: string, agentId?: string) {
+    const params = new URLSearchParams();
+    params.set("userId", userId);
+    if (agentId && agentId.trim()) {
+      params.set("agentId", agentId.trim());
+    }
+    return request<SessionHistorySummaryResponseDTO[]>(
+      buildApiUrl(`/query_session_history_list?${params.toString()}`),
+      {
+        method: "GET",
+      },
+    );
+  },
+
+  querySessionMessageList(sessionId: string) {
+    return request<SessionHistoryMessageResponseDTO[]>(
+      buildApiUrl(`/query_session_message_list?sessionId=${encodeURIComponent(sessionId)}`),
+      {
+        method: "GET",
+      },
+    );
   },
 
   chat(payload: ChatRequestDTO) {
