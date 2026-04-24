@@ -39,6 +39,48 @@ async function request<T>(url: string, init?: RequestInit): Promise<ApiResponse<
   return response.json() as Promise<ApiResponse<T>>;
 }
 
+const LIST_QUERY_PAGE_SIZE = 200;
+
+async function requestAgentConfigSummaryList(
+  payload: AgentConfigPageQueryRequestDTO,
+): Promise<ApiResponse<AgentConfigSummaryResponseDTO[]>> {
+  let pageNo = 1;
+  const records: AgentConfigSummaryResponseDTO[] = [];
+  let pageResponse = await request<AgentConfigPageResponseDTO>(buildApiUrl("/agent_config_page_query"), {
+    method: "POST",
+    body: JSON.stringify({
+      ...payload,
+      pageNo,
+      pageSize: LIST_QUERY_PAGE_SIZE,
+    }),
+  });
+
+  while (true) {
+    const pageData = pageResponse.data;
+    const pageRecords = pageData?.records ?? [];
+    records.push(...pageRecords);
+
+    const total = pageData?.total ?? records.length;
+    if (!pageData || pageRecords.length === 0 || records.length >= total) {
+      return {
+        code: pageResponse.code,
+        info: pageResponse.info,
+        data: records,
+      };
+    }
+
+    pageNo += 1;
+    pageResponse = await request<AgentConfigPageResponseDTO>(buildApiUrl("/agent_config_page_query"), {
+      method: "POST",
+      body: JSON.stringify({
+        ...payload,
+        pageNo,
+        pageSize: LIST_QUERY_PAGE_SIZE,
+      }),
+    });
+  }
+}
+
 export const agentService = {
   queryAiAgentConfigList() {
     return request<AiAgentConfigResponseDTO[]>(buildApiUrl("/query_ai_agent_config_list"), {
@@ -90,19 +132,15 @@ export const agentService = {
     );
   },
 
-  queryAgentConfigList() {
-    return request<AgentConfigSummaryResponseDTO[]>(buildApiUrl("/agent_config_list"), {
-      method: "GET",
-    });
+  async queryAgentConfigList() {
+    return requestAgentConfigSummaryList({});
   },
 
-  queryMyAgentConfigList(userId: string) {
-    return request<AgentConfigSummaryResponseDTO[]>(
-      buildApiUrl(`/agent_config_my_list?userId=${encodeURIComponent(userId)}`),
-      {
-        method: "GET",
-      },
-    );
+  async queryMyAgentConfigList(userId: string) {
+    return requestAgentConfigSummaryList({
+      ownerUserId: userId,
+      sourceType: "USER",
+    });
   },
 
   queryAgentPlazaList() {
