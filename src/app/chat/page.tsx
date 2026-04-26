@@ -679,6 +679,12 @@ function HomePageContent() {
         const historyEvent = parsePersistedHistoryEvent(rawContent);
         if (historyEvent) {
           if (historyEvent.type === "reply" || historyEvent.type === "final") {
+            // reply/final 系统事件主要用于承载“带思考轨迹的阶段回复”。
+            // 若没有任何轨迹上下文，通常是流式分片或回放冗余，避免再生成独立气泡。
+            if (pendingTraceEvents.length === 0) {
+              return;
+            }
+
             const parsed = parseResponse({ content: historyEvent.content });
             const replayedContent = normalizePotentialMojibake(parsed.content ?? "");
             if (parsed.type === "drawio" && parsed.xml) {
@@ -950,6 +956,20 @@ function HomePageContent() {
       let sawFinal = false;
       let finalMessageId = botMsgId;
 
+      const startNextAgentMessage = () => {
+        const nextMsgId = `${Date.now()}-${Math.random()}`;
+        const nextPendingBotMsg: Message = {
+          id: nextMsgId,
+          role: "agent",
+          content: "",
+          traceEvents: [],
+        };
+        appendAgentMessage(currentSessionId, nextPendingBotMsg);
+        setStreamingAgentMessageId(nextMsgId);
+        setSelectedMessageId(nextMsgId);
+        activeAgentMessageId = nextMsgId;
+      };
+
       await agentService.chatStream(
         {
           agentId: currentAgentId,
@@ -959,6 +979,17 @@ function HomePageContent() {
         },
         (streamEvent) => {
           const eventType = streamEvent.type?.toLowerCase();
+
+          const isBoundaryEvent = eventType !== "reply" && eventType !== "final";
+          const boundaryHasPayload =
+            eventType === "route" ||
+            eventType === "thinking" ||
+            (streamEvent.content ?? "").trim().length > 0;
+          if (isBoundaryEvent && boundaryHasPayload && activeReplyContent.trim()) {
+            startNextAgentMessage();
+            activeReplyContent = "";
+          }
+
           appendStreamThought(currentSessionId, activeAgentMessageId, streamEvent);
 
           if (eventType !== "reply" && eventType !== "final") return;
@@ -975,21 +1006,8 @@ function HomePageContent() {
           replaceAgentMessage(currentSessionId, activeAgentMessageId, previewText);
 
           if (eventType === "reply") {
-            if (streamEvent.partial) {
-              return;
-            }
-            const nextMsgId = `${Date.now()}-${Math.random()}`;
-            const nextPendingBotMsg: Message = {
-              id: nextMsgId,
-              role: "agent",
-              content: "",
-              traceEvents: [],
-            };
-            appendAgentMessage(currentSessionId, nextPendingBotMsg);
-            setStreamingAgentMessageId(nextMsgId);
-            setSelectedMessageId(nextMsgId);
-            activeAgentMessageId = nextMsgId;
-            activeReplyContent = "";
+            // 不按 non-partial 直接切段，避免单智能体被模型分片拆成多条消息。
+            // 切段交给上面的“阶段边界事件”逻辑处理。
             return;
           }
 
