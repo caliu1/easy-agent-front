@@ -4,12 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a8644434-072b-4e94-abdd-4ea7e102aec6" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/MarsCodeWorkspaceAppSettings.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/MarsCodeWorkspaceAppSettings.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/git_toolbox_prj.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
+    <list default="true" id="a8644434-072b-4e94-abdd-4ea7e102aec6" name="Changes" comment="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/api/agent.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/api/agent.ts" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/app/chat/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/chat/page.tsx" afterDir="false" />
@@ -79,6 +74,7 @@
     "npm.Next.js: server-side.executor": "Run",
     "settings.editor.selected.configurable": "reference.projectsettings.compiler.javacompiler",
     "to.speed.mode.migration.done": "true",
+    "ts.external.directory.path": "D:\\Project\\easy-agent\\easy-agent-front\\node_modules\\typescript\\lib",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
@@ -114,11 +110,26 @@
       <updated>1777049955494</updated>
       <workItem from="1777049957049" duration="64000" />
       <workItem from="1777050074863" duration="80000" />
-      <workItem from="1777050439486" duration="972000" />
+      <workItem from="1777050439486" duration="1690000" />
+      <workItem from="1777084910758" duration="32000" />
+      <workItem from="1777094350399" duration="2326000" />
     </task>
+    <task id="LOCAL-00001" summary="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现">
+      <option name="closed" value="true" />
+      <created>1777053026705</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1777053026705</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现" />
+    <option name="LAST_COMMIT_MESSAGE" value="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现" />
   </component>
 </project>

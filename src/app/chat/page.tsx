@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { DrawIoEmbed } from "react-drawio";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Bot, ChevronLeft, ChevronRight, Home, LogOut, Send, Settings, Trash2, User } from "lucide-react";
+import { Activity, Bot, Home, LogOut, Send, Settings, Trash2, User, Workflow } from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
 import type {
@@ -25,11 +25,36 @@ interface ThoughtEvent {
   createdAt: number;
 }
 
+interface TraceEventRecord extends ThoughtEvent {
+  messageId: string;
+  messagePreview: string;
+}
+
+interface EventGraphNode {
+  id: string;
+  label: string;
+  kind: "root" | "agent" | "tool" | "route";
+}
+
+interface EventGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  highlighted: boolean;
+}
+
 interface Message {
   id: string;
   role: Role;
   content: string;
   traceEvents?: ThoughtEvent[];
+  drawioXml?: string;
+}
+
+interface ConversationRun {
+  id: string;
+  userMessage?: Message;
+  agentMessages: Message[];
 }
 
 interface Conversation {
@@ -56,6 +81,8 @@ interface PersistedHistoryEvent {
   content: string;
   routeTarget?: string;
 }
+
+type InspectorTab = "events" | "state" | "artifacts";
 
 const isDrawioAgent = (agent?: Pick<AiAgentConfigResponseDTO, "agentId" | "agentName" | "agentDesc">) => {
   if (!agent) return false;
@@ -126,6 +153,37 @@ const buildThoughtPreview = (events: ThoughtEvent[]): string => {
   return lines.slice(-3).join("\n");
 };
 
+const clipLabel = (value: string, maxLength = 18): string => {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(1, maxLength - 1))}\u2026`;
+};
+
+const normalizeGraphId = (value: string): string => {
+  return value.trim().toLowerCase().replace(/\s+/g, "_").replace(/[^\w\u4E00-\u9FFF-]/g, "");
+};
+
+const parseRouteTarget = (content: string): string | null => {
+  const bracketMatch = content.match(/[（(]([^（）()]{1,64})[）)]/);
+  if (bracketMatch?.[1]?.trim()) {
+    return bracketMatch[1].trim();
+  }
+  return null;
+};
+
+const parseToolName = (content: string): string | null => {
+  const nameMatch = content.match(/name["'\s:：=]+([A-Za-z_][A-Za-z0-9_]{1,63})/);
+  if (nameMatch?.[1]) {
+    return nameMatch[1];
+  }
+
+  const fnMatch = content.match(/\b(get_[a-z0-9_]{2,}|[a-z][a-z0-9_]{2,}_tool)\b/i);
+  if (fnMatch?.[1]) {
+    return fnMatch[1];
+  }
+
+  return null;
+};
+
 function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -133,8 +191,6 @@ function HomePageContent() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
-  const [isChatOpen, setIsChatOpen] = useState(true);
-  const [isBookmarksOpen, setIsBookmarksOpen] = useState(true);
   const [agentList, setAgentList] = useState<AiAgentConfigResponseDTO[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [userId, setUserId] = useState("");
@@ -146,6 +202,9 @@ function HomePageContent() {
   const [inputValue, setInputValue] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [streamingAgentMessageId, setStreamingAgentMessageId] = useState("");
+  const [selectedMessageId, setSelectedMessageId] = useState("");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("events");
+  const [selectedInspectorEventIdx, setSelectedInspectorEventIdx] = useState(0);
 
   const drawioAgentIdSet = useMemo(() => {
     const set = new Set<string>();
@@ -171,6 +230,228 @@ function HomePageContent() {
     if (!selectedAgentId) return conversations;
     return conversations.filter((conversation) => conversation.agentId === selectedAgentId);
   }, [conversations, selectedAgentId]);
+
+  const selectedAgent = useMemo(() => {
+    return agentList.find((item) => item.agentId === selectedAgentId);
+  }, [agentList, selectedAgentId]);
+
+  const selectedMessage = useMemo(() => {
+    return messages.find((item) => item.id === selectedMessageId && item.role === "agent");
+  }, [messages, selectedMessageId]);
+
+  const messageRuns = useMemo<ConversationRun[]>(() => {
+    const runs: ConversationRun[] = [];
+    let activeRun: ConversationRun | null = null;
+    let orphanCount = 0;
+
+    messages.forEach((message) => {
+      if (message.role === "user") {
+        if (activeRun) {
+          runs.push(activeRun);
+        }
+        activeRun = {
+          id: `run-${message.id}`,
+          userMessage: message,
+          agentMessages: [],
+        };
+        return;
+      }
+
+      if (!activeRun) {
+        orphanCount += 1;
+        activeRun = {
+          id: `run-orphan-${orphanCount}-${message.id}`,
+          agentMessages: [],
+        };
+      }
+      activeRun.agentMessages.push(message);
+    });
+
+    if (activeRun) {
+      runs.push(activeRun);
+    }
+
+    return runs;
+  }, [messages]);
+
+  const runIndexByMessageId = useMemo(() => {
+    const map = new Map<string, number>();
+    messageRuns.forEach((run, index) => {
+      const runNumber = index + 1;
+      if (run.userMessage) {
+        map.set(run.userMessage.id, runNumber);
+      }
+      run.agentMessages.forEach((message) => map.set(message.id, runNumber));
+    });
+    return map;
+  }, [messageRuns]);
+
+  const traceEventFeed = useMemo<TraceEventRecord[]>(() => {
+    const records: TraceEventRecord[] = [];
+    messages.forEach((message) => {
+      if (message.role !== "agent" || !message.traceEvents?.length) return;
+      message.traceEvents.forEach((event) => {
+        records.push({
+          ...event,
+          messageId: message.id,
+          messagePreview: message.content.slice(0, 80),
+        });
+      });
+    });
+
+    return records.sort((a, b) => a.createdAt - b.createdAt);
+  }, [messages]);
+
+  const inspectorEvents = useMemo<TraceEventRecord[]>(() => {
+    if (selectedMessage?.traceEvents?.length) {
+      return selectedMessage.traceEvents.map((event) => ({
+        ...event,
+        messageId: selectedMessage.id,
+        messagePreview: selectedMessage.content.slice(0, 80),
+      }));
+    }
+    return traceEventFeed.slice(-18);
+  }, [selectedMessage, traceEventFeed]);
+
+  const activeInspectorEvent = useMemo(() => {
+    if (!inspectorEvents.length) return null;
+    const safeIndex = Math.min(Math.max(0, selectedInspectorEventIdx), inspectorEvents.length - 1);
+    return inspectorEvents[safeIndex];
+  }, [inspectorEvents, selectedInspectorEventIdx]);
+
+  const eventGraph = useMemo(() => {
+    const rootLabel = selectedAgent?.agentName || activeInspectorEvent?.agentName || "root_agent";
+    const nodeMap = new Map<string, EventGraphNode>();
+    const edges: EventGraphEdge[] = [];
+
+    const ensureNode = (label: string, kind: EventGraphNode["kind"]) => {
+      const id = normalizeGraphId(label) || `node_${nodeMap.size}`;
+      if (!nodeMap.has(id)) {
+        nodeMap.set(id, { id, label, kind });
+      }
+      return id;
+    };
+
+    const rootNodeId = ensureNode(rootLabel, "root");
+    const total = inspectorEvents.length;
+    const center = Math.min(Math.max(0, selectedInspectorEventIdx), Math.max(0, total - 1));
+    const windowStart = Math.max(0, center - 2);
+    const windowEnd = Math.min(total, center + 2);
+    const windowEvents = inspectorEvents.slice(windowStart, windowEnd);
+
+    windowEvents.forEach((event) => {
+      const fromLabel = event.agentName?.trim() || rootLabel;
+      const fromId = ensureNode(fromLabel, fromLabel === rootLabel ? "root" : "agent");
+
+      const routeTarget = event.type === "route" ? parseRouteTarget(event.content) : null;
+      const toolTarget = parseToolName(event.content);
+      const toLabel = routeTarget || toolTarget;
+      if (toLabel) {
+        const nodeKind: EventGraphNode["kind"] = routeTarget ? "route" : "tool";
+        const toId = ensureNode(toLabel, nodeKind);
+        if (toId !== fromId) {
+          edges.push({
+            id: `${event.id}-${fromId}-${toId}`,
+            from: fromId,
+            to: toId,
+            highlighted: activeInspectorEvent?.id === event.id,
+          });
+        }
+        return;
+      }
+
+      if (fromId !== rootNodeId) {
+        edges.push({
+          id: `${event.id}-${rootNodeId}-${fromId}`,
+          from: rootNodeId,
+          to: fromId,
+          highlighted: activeInspectorEvent?.id === event.id,
+        });
+      }
+    });
+
+    const nodes = Array.from(nodeMap.values());
+    const nonRootNodes = nodes.filter((node) => node.id !== rootNodeId);
+    const rows = Math.max(1, Math.min(4, nonRootNodes.length));
+    const columns = Math.max(1, Math.ceil(nonRootNodes.length / 4));
+    const graphHeight = Math.max(112, rows * 48 + 24);
+    const graphWidth = 180 + columns * 160;
+
+    const positions = new Map<string, { x: number; y: number; w: number; h: number }>();
+    positions.set(rootNodeId, { x: 24, y: Math.max(16, graphHeight / 2 - 18), w: 132, h: 36 });
+    nonRootNodes.forEach((node, index) => {
+      const col = Math.floor(index / 4);
+      const row = index % 4;
+      positions.set(node.id, {
+        x: 200 + col * 150,
+        y: 14 + row * 48,
+        w: 132,
+        h: 34,
+      });
+    });
+
+    const uniqueEdges = edges.filter((edge, index, arr) => {
+      return arr.findIndex((item) => item.from === edge.from && item.to === edge.to) === index;
+    });
+
+    return {
+      width: graphWidth,
+      height: graphHeight,
+      nodes,
+      edges: uniqueEdges,
+      positions,
+      rootNodeId,
+    };
+  }, [activeInspectorEvent, inspectorEvents, selectedAgent, selectedInspectorEventIdx]);
+
+  const inspectorStateJson = useMemo(() => {
+    const stateSnapshot = {
+      selectedAgentId,
+      selectedAgentName: selectedAgent?.agentName ?? null,
+      activeConversationId: activeConvId || null,
+      sessionId: sessionId || null,
+      messageCount: messages.length,
+      runCount: messageRuns.length,
+      selectedMessageId: selectedMessage?.id ?? null,
+      selectedRun: selectedMessage ? (runIndexByMessageId.get(selectedMessage.id) ?? null) : null,
+      totalTokens: activeConversation?.totalTokens ?? 0,
+      updatedAt: activeConversation?.updatedAt ?? null,
+    };
+    return JSON.stringify(stateSnapshot, null, 2);
+  }, [
+    activeConvId,
+    activeConversation,
+    messageRuns.length,
+    messages.length,
+    runIndexByMessageId,
+    selectedAgent,
+    selectedAgentId,
+    selectedMessage,
+    sessionId,
+  ]);
+
+  const selectedMessageJson = useMemo(() => {
+    if (!selectedMessage) return "";
+    return JSON.stringify(selectedMessage, null, 2);
+  }, [selectedMessage]);
+
+  const drawioArtifactSummary = useMemo(() => {
+    if (!drawioXml.trim()) {
+      return {
+        hasArtifact: false,
+        vertexCount: 0,
+        edgeCount: 0,
+      };
+    }
+
+    const vertexCount = (drawioXml.match(/<mxCell[^>]*vertex=\"1\"/g) ?? []).length;
+    const edgeCount = (drawioXml.match(/<mxCell[^>]*edge=\"1\"/g) ?? []).length;
+    return {
+      hasArtifact: true,
+      vertexCount,
+      edgeCount,
+    };
+  }, [drawioXml]);
 
   const defaultConversationAgentId = useMemo(() => {
     const availableAgentIds = new Set(agentList.map((agent) => agent.agentId));
@@ -200,18 +481,18 @@ function HomePageContent() {
     setMessages((prev) => {
       const existed = prev.some((m) => m.id === messageId);
       if (existed) {
-        return prev.map((m) => (m.id === messageId ? { ...m, content } : m));
+        return prev.map((m) => (m.id === messageId ? { ...m, content, drawioXml: nextXml ?? m.drawioXml } : m));
       }
-      return [...prev, { id: messageId, role: "agent", content, traceEvents: [] }];
+      return [...prev, { id: messageId, role: "agent", content, traceEvents: [], drawioXml: nextXml }];
     });
     setConversations((prev) => {
       const next = prev.map((c) => {
         if (c.id !== convId) return c;
 
         const existed = c.messages.some((m) => m.id === messageId);
-        const appendedMessage: Message = { id: messageId, role: "agent", content, traceEvents: [] };
+        const appendedMessage: Message = { id: messageId, role: "agent", content, traceEvents: [], drawioXml: nextXml };
         const nextMessages = existed
-          ? c.messages.map((m) => (m.id === messageId ? { ...m, content } : m))
+          ? c.messages.map((m) => (m.id === messageId ? { ...m, content, drawioXml: nextXml ?? m.drawioXml } : m))
           : [...c.messages, appendedMessage];
 
         return {
@@ -409,6 +690,7 @@ function HomePageContent() {
               role: "agent",
               content: replayedContent,
               traceEvents: pendingTraceEvents,
+              drawioXml: parsed.type === "drawio" ? parsed.xml : undefined,
             });
             pendingTraceEvents = [];
             return;
@@ -470,6 +752,7 @@ function HomePageContent() {
         role: "agent",
         content: agentContent,
         traceEvents: pendingTraceEvents,
+        drawioXml: parsed.type === "drawio" ? parsed.xml : undefined,
       });
       pendingTraceEvents = [];
     });
@@ -497,6 +780,8 @@ function HomePageContent() {
 
     const { messages: nextMessages, drawioXml: nextDrawioXml } = mapSessionMessagesToUI(response.data ?? []);
     setMessages(nextMessages);
+    const latestAgentMessage = [...nextMessages].reverse().find((item) => item.role === "agent");
+    setSelectedMessageId(latestAgentMessage?.id ?? "");
     setDrawioXml(nextDrawioXml);
     setConversations((prev) =>
       prev.map((conversation) =>
@@ -561,6 +846,7 @@ function HomePageContent() {
     setSessionId(sid);
     setActiveConvId(sid);
     setSelectedAgentId(agentId);
+    setSelectedMessageId("");
     setMessages([]);
     setDrawioXml("");
     setConversations((prev) => [nextConversation, ...prev.filter((item) => item.id !== sid)]);
@@ -643,6 +929,7 @@ function HomePageContent() {
         content: "",
         traceEvents: [],
       };
+      setSelectedMessageId(botMsgId);
 
       setMessages((prev) => [...prev, userMsg, pendingBotMsg]);
       setConversations((prev) => {
@@ -700,6 +987,7 @@ function HomePageContent() {
             };
             appendAgentMessage(currentSessionId, nextPendingBotMsg);
             setStreamingAgentMessageId(nextMsgId);
+            setSelectedMessageId(nextMsgId);
             activeAgentMessageId = nextMsgId;
             activeReplyContent = "";
             return;
@@ -752,20 +1040,72 @@ function HomePageContent() {
     }
   };
 
+  const handleSwitchAgent = async (nextAgentId: string) => {
+    if (!nextAgentId || !userId || nextAgentId === selectedAgentId) return;
+    streamAbortRef.current?.abort();
+    setSelectedAgentId(nextAgentId);
+    setSessionId("");
+    setActiveConvId("");
+    setMessages([]);
+    setDrawioXml("");
+    setSelectedMessageId("");
+    await loadSessionHistoryList(userId, nextAgentId);
+  };
+
   const handleSelectConversation = async (id: string) => {
     const current = conversations.find((c) => c.id === id);
     if (!current) return;
     setActiveConvId(current.id);
     setSessionId(current.sessionId);
     setSelectedAgentId(current.agentId);
+    setSelectedMessageId("");
     setMessages(current.messages ?? []);
     setDrawioXml(current.drawioXml ?? "");
     await loadConversationMessages(current.sessionId);
   };
 
-  const handleDeleteConversation = (id: string) => {
-    if (!id) return;
-    window.alert("当前版本暂不支持删除会话历史。");
+  const handleDeleteConversation = async (id: string) => {
+    if (!id || !userId) return;
+
+    const targetConversation = conversations.find((item) => item.id === id);
+    const targetTitle = targetConversation?.title?.trim() || "该会话";
+    const confirmed = window.confirm(`确认删除会话「${targetTitle}」吗？删除后不可恢复。`);
+    if (!confirmed) return;
+
+    const deletingActiveConversation = activeConvId === id;
+    if (deletingActiveConversation) {
+      streamAbortRef.current?.abort();
+      setStreamingAgentMessageId("");
+      setIsSending(false);
+    }
+
+    try {
+      const response = await agentService.deleteSession({
+        sessionId: id,
+        userId,
+      });
+      if (response.code !== SUCCESS_CODE || response.data !== true) {
+        window.alert(response.info || "删除会话失败，请稍后重试。");
+        return;
+      }
+
+      const nextPreferredSessionId = deletingActiveConversation ? undefined : activeConvId;
+      const reloadAgentId = selectedAgentId || targetConversation?.agentId;
+      if (!reloadAgentId) {
+        setConversations([]);
+        setActiveConvId("");
+        setSessionId("");
+        setMessages([]);
+        setDrawioXml("");
+        setSelectedMessageId("");
+        return;
+      }
+
+      await loadSessionHistoryList(userId, reloadAgentId, nextPreferredSessionId);
+    } catch (error) {
+      console.error("Delete session failed", error);
+      window.alert("删除会话失败，请稍后重试。");
+    }
   };
 
   const handleLogout = () => {
@@ -824,7 +1164,29 @@ function HomePageContent() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isChatOpen]);
+  }, [messages]);
+
+  useEffect(() => {
+    if (selectedMessageId) {
+      const exists = messages.some((item) => item.id === selectedMessageId);
+      if (exists) return;
+    }
+    const latestAgentMessage = [...messages].reverse().find((item) => item.role === "agent");
+    setSelectedMessageId(latestAgentMessage?.id ?? "");
+  }, [messages, selectedMessageId]);
+
+  useEffect(() => {
+    if (isDrawioSession || inspectorTab !== "artifacts") return;
+    setInspectorTab("events");
+  }, [inspectorTab, isDrawioSession]);
+
+  useEffect(() => {
+    if (!inspectorEvents.length) {
+      setSelectedInspectorEventIdx(0);
+      return;
+    }
+    setSelectedInspectorEventIdx(inspectorEvents.length - 1);
+  }, [inspectorEvents]);
 
   useEffect(() => {
     return () => {
@@ -833,188 +1195,490 @@ function HomePageContent() {
   }, []);
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-zinc-50 font-sans">
-      <aside
-        className={`relative h-full border-r border-gray-200 bg-white shadow-sm transition-all duration-300 ${isBookmarksOpen ? "w-64" : "w-0"}`}
-      >
-        <button
-          onClick={() => setIsBookmarksOpen(!isBookmarksOpen)}
-          className="absolute -right-8 top-1/2 z-10 flex h-16 w-8 -translate-y-1/2 items-center justify-center rounded-r-lg border border-l-0 border-gray-200 bg-white"
-        >
-          {isBookmarksOpen ? <ChevronLeft size={20} /> : <ChevronRight size={20} />}
-        </button>
-
-        <div className={`flex h-full w-64 flex-col ${isBookmarksOpen ? "opacity-100" : "overflow-hidden opacity-0"}`}>
-          <div className="flex h-14 items-center border-b border-gray-200 bg-gray-50 px-4 font-semibold text-gray-700">
-            {"\u4F1A\u8BDD\u5217\u8868"}
+    <div className="flex h-screen flex-col bg-slate-100 text-slate-800">
+      <header className="border-b border-slate-200 bg-white">
+        <div className="flex h-14 items-center justify-between px-4">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-600 text-white">
+              <Bot size={16} />
+            </div>
+            <div className="leading-tight">
+              <p className="text-sm font-semibold">EasyAgent Chat</p>
+              <p className="text-[11px] text-slate-500">ADK Dev UI Style</p>
+            </div>
           </div>
 
-          <div className="p-3">
+          <div className="flex items-center gap-2">
+            <div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 md:flex">
+              <label className="text-xs font-medium text-slate-500">Agent</label>
+              <select
+                value={selectedAgentId}
+                onChange={(event) => {
+                  void handleSwitchAgent(event.target.value);
+                }}
+                className="max-w-56 truncate bg-transparent text-sm text-slate-700 outline-none"
+              >
+                {agentList.map((agent) => (
+                  <option key={agent.agentId} value={agent.agentId}>
+                    {agent.agentName}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <button
-              className="w-full rounded-md bg-blue-600 py-2 text-sm text-white hover:bg-blue-700"
+              onClick={() => router.push("/")}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
+            >
+              <Home size={14} />
+              EasyAgent
+            </button>
+            <button
+              onClick={() => router.push("/agent-admin")}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
+            >
+              <Settings size={14} />
+              Admin
+            </button>
+            <button onClick={handleLogout} className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-rose-500">
+              <LogOut size={18} />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="flex min-h-0 flex-1">
+        <aside className="flex w-72 flex-col border-r border-slate-200 bg-white">
+          <div className="border-b border-slate-200 px-3 py-3">
+            <button
+              className="w-full rounded-lg bg-blue-600 py-2 text-sm font-medium text-white hover:bg-blue-700"
               onClick={handleCreateNewConversation}
             >
-              {"\u65B0\u5EFA\u4F1A\u8BDD"}
+              新建会话
             </button>
           </div>
 
-          <div className="flex-1 overflow-y-auto">
+          <div className="min-h-0 flex-1 overflow-y-auto">
             {visibleConversations.map((conv) => (
               <div
                 key={conv.id}
-                onClick={() => handleSelectConversation(conv.id)}
-                className={`flex cursor-pointer items-center justify-between border-b border-gray-100 px-3 py-2 ${activeConvId === conv.id ? "bg-blue-50" : "bg-white"}`}
+                onClick={() => void handleSelectConversation(conv.id)}
+                className={`cursor-pointer border-b border-slate-100 px-3 py-3 ${
+                  activeConvId === conv.id ? "bg-blue-50" : "bg-white hover:bg-slate-50"
+                }`}
               >
-                <div className="min-w-0 flex-1 pr-2">
-                  <div className="truncate text-sm font-medium text-gray-800">{conv.title || "Conversation"}</div>
-                  <div className="truncate text-xs text-gray-400">{conv.sessionId}</div>
-                  <div className="truncate text-[11px] text-gray-400">{conv.totalTokens} tokens</div>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-slate-800">{conv.title || "Conversation"}</p>
+                    <p className="mt-1 truncate text-[11px] text-slate-500">{conv.sessionId}</p>
+                    <p className="mt-1 text-[11px] text-slate-400">{conv.totalTokens} tokens</p>
+                  </div>
+                  <button
+                    className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleDeleteConversation(conv.id);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </div>
-                <button
-                  className="p-1 text-gray-400 hover:text-red-500"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDeleteConversation(conv.id);
-                  }}
-                >
-                  <Trash2 size={14} />
-                </button>
               </div>
             ))}
             {visibleConversations.length === 0 ? (
-              <div className="px-3 py-6 text-center text-xs text-gray-400">当前Agent暂无会话</div>
+              <div className="px-4 py-8 text-center text-xs text-slate-400">当前 Agent 暂无会话</div>
             ) : null}
           </div>
-        </div>
-      </aside>
+        </aside>
 
-      {isDrawioSession ? (
-        <main className="flex h-full flex-1 flex-col">
-          <div className="h-full w-full p-4">
-            <div className="h-full w-full overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
-              <DrawIoEmbed urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }} xml={drawioXml} />
-            </div>
-          </div>
-        </main>
-      ) : null}
-
-      <div
-        className={`relative h-full border-l border-gray-200 bg-white shadow-xl transition-all duration-300 ${isChatOpen ? (isDrawioSession ? "w-96" : "flex-1") : "w-0"}`}
-      >
-        <button
-          onClick={() => setIsChatOpen(!isChatOpen)}
-          className="absolute -left-8 top-1/2 z-10 flex h-16 w-8 -translate-y-1/2 items-center justify-center rounded-l-lg border border-r-0 border-gray-200 bg-white"
-        >
-          {isChatOpen ? <ChevronRight size={20} /> : <ChevronLeft size={20} />}
-        </button>
-
-        <div className={`flex h-full ${isDrawioSession ? "w-96" : "w-full"} flex-col ${isChatOpen ? "opacity-100" : "overflow-hidden opacity-0"}`}>
-          <div className="border-b border-gray-200 bg-gray-50">
-            <div className="flex h-14 items-center justify-between px-4">
-              <div className="flex items-center text-gray-700">
-                <Bot size={20} className="mr-2 text-blue-600" />
-                <h2 className="font-semibold">EasyAgent平台</h2>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => router.push("/")}
-                  className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-100"
-                >
-                  <Home size={14} />
-                  EasyAgent
-                </button>
-                <button
-                  onClick={() => router.push("/agent-admin")}
-                  className="inline-flex items-center gap-1 rounded-md border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-100"
-                >
-                  <Settings size={14} />
-                  Admin
-                </button>
-                <button onClick={handleLogout} className="text-gray-500 hover:text-red-500">
-                  <LogOut size={18} />
-                </button>
-              </div>
-            </div>
+        <main className="flex min-w-0 flex-1 flex-col">
+          <div className="border-b border-slate-200 bg-white px-4 py-3">
+            <p className="text-sm font-semibold text-slate-800">{activeConversation?.title || "New Chat"}</p>
+            <p className="mt-1 truncate text-xs text-slate-500">
+              {activeConversation?.sessionId || "未创建会话"} · {selectedAgent?.agentName || "未选择 Agent"}
+            </p>
           </div>
 
-          <div className="flex-1 space-y-4 overflow-y-auto bg-white p-4">
-            {messages.map((msg) => (
-              <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                <div className={`flex max-w-[85%] ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}>
-                  <div className="mt-1 shrink-0">
-                    {msg.role === "user" ? (
-                      <div className="ml-2 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100">
-                        <User size={16} className="text-blue-600" />
-                      </div>
-                    ) : (
-                      <div className="mr-2 flex h-8 w-8 items-center justify-center rounded-full border border-gray-200 bg-gray-100">
-                        <Bot size={16} className="text-gray-600" />
-                      </div>
-                    )}
-                  </div>
-                  <div
-                    className={`rounded-2xl p-3 text-sm leading-relaxed ${
-                      msg.role === "user" ? "rounded-tr-sm bg-blue-600 text-white" : "rounded-tl-sm bg-gray-100 text-gray-800"
-                    }`}
-                  >
-                    {msg.role === "agent" && (streamingAgentMessageId === msg.id || (msg.traceEvents?.length ?? 0) > 0) ? (
-                      streamingAgentMessageId === msg.id ? (
-                        <div className="max-h-[3.75rem] overflow-hidden whitespace-pre-wrap text-xs leading-5 text-gray-500">
-                          {buildThoughtPreview(msg.traceEvents ?? [])}
-                        </div>
-                      ) : (
-                        <details className="mb-2">
-                          <summary className="list-none cursor-pointer text-xs text-gray-500 hover:text-gray-700 [&::-webkit-details-marker]:hidden">
-                            <span className="inline-flex items-center gap-1">
-                              <span>Thought for {calcThoughtDurationSeconds(msg.traceEvents ?? [])}s</span>
-                              <span aria-hidden>{">"}</span>
-                            </span>
-                          </summary>
-                          <div className="mt-2 max-h-48 space-y-2 overflow-y-auto pr-1">
-                            {(msg.traceEvents ?? []).map((event) => (
-                              <p key={event.id} className="whitespace-pre-wrap text-xs leading-5 text-gray-500">
-                                {event.type === "route" ? "[route] " : ""}
-                                {event.content}
-                              </p>
-                            ))}
-                          </div>
-                        </details>
-                      )
-                    ) : null}
-
-                    {msg.content.trim() ? <p className="whitespace-pre-wrap">{msg.content}</p> : null}
-                  </div>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+            {messages.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-400">
+                开始一段新对话吧，消息会按 ADK 风格实时流式展示。
+              </div>
+            ) : null}
+            {messageRuns.map((run, runIndex) => (
+              <section key={run.id} className="rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm">
+                <div className="mb-2 flex items-center justify-between text-[11px] text-slate-500">
+                  <span className="font-semibold text-slate-600">Run #{runIndex + 1}</span>
+                  <span>{run.agentMessages.length} agent message(s)</span>
                 </div>
-              </div>
+
+                {run.userMessage ? (
+                  <div className="mb-2 flex justify-end">
+                    <div className="flex max-w-[88%] flex-row-reverse">
+                      <div className="mt-1 shrink-0">
+                        <div className="ml-2 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100">
+                          <User size={16} className="text-blue-600" />
+                        </div>
+                      </div>
+                      <div className="rounded-2xl rounded-tr-sm bg-blue-600 px-3 py-2.5 text-sm leading-relaxed text-white">
+                        {run.userMessage.content.trim() ? (
+                          <p className="whitespace-pre-wrap">{run.userMessage.content}</p>
+                        ) : (
+                          <p className="text-white/70">...</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="space-y-2">
+                  {run.agentMessages.map((msg) => {
+                    const hasDiagram = isDrawioSession && Boolean(msg.drawioXml);
+                    return (
+                    <div key={msg.id} className="flex justify-start">
+                      <div className={`flex flex-row ${hasDiagram ? "w-full" : "max-w-[92%]"}`}>
+                        <div className="mt-1 shrink-0">
+                          <div className="mr-2 flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-slate-100">
+                            <Bot size={16} className="text-slate-600" />
+                          </div>
+                        </div>
+
+                        <div
+                          onClick={() => {
+                            setSelectedMessageId(msg.id);
+                          }}
+                          className={`rounded-2xl rounded-tl-sm border p-2.5 text-sm leading-relaxed ${
+                            hasDiagram ? "w-full" : ""
+                          } ${
+                            selectedMessageId === msg.id
+                              ? "border-blue-300 bg-blue-50 text-slate-800"
+                              : "border-slate-200 bg-white text-slate-800"
+                          }`}
+                        >
+                          {streamingAgentMessageId === msg.id || (msg.traceEvents?.length ?? 0) > 0 ? (
+                            streamingAgentMessageId === msg.id ? (
+                              <div className="mb-2 max-h-[3.75rem] overflow-hidden whitespace-pre-wrap rounded-lg bg-slate-100 px-2 py-1 text-xs leading-5 text-slate-500">
+                                {buildThoughtPreview(msg.traceEvents ?? [])}
+                              </div>
+                            ) : (
+                              <details className="mb-2">
+                                <summary className="list-none cursor-pointer text-xs text-slate-500 hover:text-slate-700 [&::-webkit-details-marker]:hidden">
+                                  <span className="inline-flex items-center gap-1">
+                                    <Activity size={12} />
+                                    <span>Thought for {calcThoughtDurationSeconds(msg.traceEvents ?? [])}s</span>
+                                    <span aria-hidden>{">"}</span>
+                                  </span>
+                                </summary>
+                                <div className="mt-2 max-h-44 space-y-2 overflow-y-auto rounded-lg bg-slate-100 p-2">
+                                  {(msg.traceEvents ?? []).map((event) => (
+                                    <p key={event.id} className="whitespace-pre-wrap text-xs leading-5 text-slate-600">
+                                      {event.type === "route" ? "[route] " : ""}
+                                      {event.content}
+                                    </p>
+                                  ))}
+                                </div>
+                              </details>
+                            )
+                          ) : null}
+
+                          {msg.content.trim() ? (
+                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                          ) : (
+                            <p className="text-xs text-slate-400">Waiting for response...</p>
+                          )}
+
+                          {hasDiagram ? (
+                            <div className="mt-2 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                              <div className="h-[28rem] w-full md:h-[48rem]">
+                                <DrawIoEmbed
+                                  urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }}
+                                  xml={msg.drawioXml}
+                                />
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                    );
+                  })}
+                </div>
+              </section>
             ))}
             <div ref={messagesEndRef} />
           </div>
 
-          <div className="border-t border-gray-200 bg-white p-4">
-            <div className="flex items-center rounded-full border border-gray-200 bg-gray-50 px-4 py-2">
+          <div className="border-t border-slate-200 bg-white p-3">
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
               <input
-                className="flex-1 bg-transparent text-sm text-gray-700 outline-none"
-                placeholder={"\u8BF7\u8F93\u5165\u4F60\u7684\u95EE\u9898..."}
+                className="flex-1 bg-transparent text-sm text-slate-700 outline-none"
+                placeholder="请输入你的问题..."
                 value={inputValue}
-                onChange={(e) => setInputValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleSendMessage();
+                onChange={(event) => setInputValue(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    void handleSendMessage();
+                  }
                 }}
               />
               <button
-                onClick={handleSendMessage}
+                onClick={() => void handleSendMessage()}
                 disabled={!inputValue.trim() || isSending}
-                className={`ml-2 flex items-center justify-center rounded-full p-1.5 ${
+                className={`flex h-8 w-8 items-center justify-center rounded-full ${
                   inputValue.trim() && !isSending
-                    ? "cursor-pointer bg-blue-600 text-white hover:bg-blue-700"
-                    : "cursor-not-allowed bg-gray-200 text-gray-400"
+                    ? "bg-blue-600 text-white hover:bg-blue-700"
+                    : "cursor-not-allowed bg-slate-200 text-slate-400"
                 }`}
               >
-                <Send size={16} />
+                <Send size={15} />
               </button>
             </div>
           </div>
-        </div>
+        </main>
+
+        <aside className="hidden w-[380px] flex-col border-l border-slate-200 bg-white xl:flex">
+          <div className="border-b border-slate-200 px-4 py-3">
+            <p className="text-sm font-semibold text-slate-800">Run Inspector</p>
+            <p className="mt-1 text-xs text-slate-500">参考 ADK Dev UI 的事件与状态视图</p>
+          </div>
+
+          <div className="border-b border-slate-200 px-4 py-2">
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <button
+                onClick={() => setInspectorTab("events")}
+                className={`rounded-md px-2 py-1.5 ${
+                  inspectorTab === "events"
+                    ? "bg-blue-600 text-white"
+                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                Events
+              </button>
+              <button
+                onClick={() => setInspectorTab("state")}
+                className={`rounded-md px-2 py-1.5 ${
+                  inspectorTab === "state"
+                    ? "bg-blue-600 text-white"
+                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                State
+              </button>
+              <button
+                onClick={() => setInspectorTab("artifacts")}
+                disabled={!isDrawioSession}
+                className={`rounded-md px-2 py-1.5 ${
+                  inspectorTab === "artifacts"
+                    ? "bg-blue-600 text-white"
+                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                } ${!isDrawioSession ? "cursor-not-allowed opacity-40" : ""}`}
+              >
+                Artifacts
+              </button>
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+            <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <p className="mb-2 text-xs font-semibold text-slate-600">当前会话</p>
+              <p className="truncate text-xs text-slate-500">Agent: {selectedAgent?.agentName || "-"}</p>
+              <p className="mt-1 truncate text-xs text-slate-500">Session: {sessionId || "-"}</p>
+              <p className="mt-1 text-xs text-slate-500">Runs: {messageRuns.length}</p>
+              <p className="mt-1 text-xs text-slate-500">Messages: {messages.length}</p>
+              <p className="mt-1 text-xs text-slate-500">Tokens: {activeConversation?.totalTokens ?? 0}</p>
+            </section>
+
+            {inspectorTab === "events" ? (
+              <section className="rounded-xl border border-slate-200 bg-white p-3">
+                <div className="mb-2 flex items-center gap-2 text-xs font-semibold text-slate-600">
+                  <Workflow size={13} />
+                  <span>{selectedMessage ? "已选消息事件轨迹" : "最近事件流"}</span>
+                </div>
+                <div className="mb-3 rounded-lg border border-slate-700 bg-slate-900 p-2 text-slate-100">
+                  <div className="mb-2 flex items-center justify-between text-[11px]">
+                    <span>
+                      Event {inspectorEvents.length ? selectedInspectorEventIdx + 1 : 0} of {inspectorEvents.length}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => setSelectedInspectorEventIdx((prev) => Math.max(0, prev - 1))}
+                        disabled={selectedInspectorEventIdx <= 0 || !inspectorEvents.length}
+                        className="rounded border border-slate-600 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {"<"}
+                      </button>
+                      <button
+                        onClick={() =>
+                          setSelectedInspectorEventIdx((prev) => Math.min(inspectorEvents.length - 1, prev + 1))
+                        }
+                        disabled={!inspectorEvents.length || selectedInspectorEventIdx >= inspectorEvents.length - 1}
+                        className="rounded border border-slate-600 px-1.5 py-0.5 text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {">"}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="overflow-x-auto rounded-md border border-slate-700 bg-slate-950">
+                    <svg width={eventGraph.width} height={eventGraph.height} className="block">
+                      <defs>
+                        <marker
+                          id="event-arrow"
+                          markerWidth="8"
+                          markerHeight="8"
+                          refX="7"
+                          refY="4"
+                          orient="auto"
+                          markerUnits="strokeWidth"
+                        >
+                          <path d="M0,0 L8,4 L0,8 z" fill="#94a3b8" />
+                        </marker>
+                        <marker
+                          id="event-arrow-active"
+                          markerWidth="8"
+                          markerHeight="8"
+                          refX="7"
+                          refY="4"
+                          orient="auto"
+                          markerUnits="strokeWidth"
+                        >
+                          <path d="M0,0 L8,4 L0,8 z" fill="#34d399" />
+                        </marker>
+                      </defs>
+
+                      {eventGraph.edges.map((edge) => {
+                        const from = eventGraph.positions.get(edge.from);
+                        const to = eventGraph.positions.get(edge.to);
+                        if (!from || !to) return null;
+                        const fromX = from.x + from.w;
+                        const fromY = from.y + from.h / 2;
+                        const toX = to.x;
+                        const toY = to.y + to.h / 2;
+                        const midX = Math.round((fromX + toX) / 2);
+                        return (
+                          <path
+                            key={edge.id}
+                            d={`M ${fromX} ${fromY} L ${midX} ${fromY} L ${midX} ${toY} L ${toX} ${toY}`}
+                            fill="none"
+                            stroke={edge.highlighted ? "#34d399" : "#94a3b8"}
+                            strokeWidth={edge.highlighted ? 2.2 : 1.6}
+                            markerEnd={edge.highlighted ? "url(#event-arrow-active)" : "url(#event-arrow)"}
+                            opacity={edge.highlighted ? 1 : 0.85}
+                          />
+                        );
+                      })}
+
+                      {eventGraph.nodes.map((node) => {
+                        const pos = eventGraph.positions.get(node.id);
+                        if (!pos) return null;
+                        const isRoot = node.kind === "root";
+                        const fillColor = isRoot ? "#0f766e" : node.kind === "tool" ? "#166534" : "#1e293b";
+                        const borderColor = isRoot ? "#14b8a6" : node.kind === "tool" ? "#22c55e" : "#64748b";
+                        return (
+                          <g key={node.id}>
+                            <rect
+                              x={pos.x}
+                              y={pos.y}
+                              width={pos.w}
+                              height={pos.h}
+                              rx={18}
+                              fill={fillColor}
+                              stroke={borderColor}
+                              strokeWidth={1.5}
+                            />
+                            <text
+                              x={pos.x + pos.w / 2}
+                              y={pos.y + pos.h / 2 + 4}
+                              textAnchor="middle"
+                              fontSize="12"
+                              fill="#e2e8f0"
+                            >
+                              {clipLabel(node.label, 16)}
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                  </div>
+                  <p className="mt-2 truncate text-[11px] text-slate-300">
+                    {activeInspectorEvent ? activeInspectorEvent.content : "暂无可视化事件"}
+                  </p>
+                </div>
+                <div className="max-h-[34rem] space-y-2 overflow-y-auto">
+                  {inspectorEvents.length ? (
+                    inspectorEvents.map((event, eventIdx) => (
+                      <div
+                        key={`${event.id}-${event.createdAt}`}
+                        onClick={() => setSelectedInspectorEventIdx(eventIdx)}
+                        className={`cursor-pointer rounded-lg border p-2 ${
+                          selectedInspectorEventIdx === eventIdx
+                            ? "border-emerald-300 bg-emerald-50"
+                            : "border-slate-100 bg-slate-50 hover:border-slate-200"
+                        }`}
+                      >
+                        <p className="text-[11px] font-medium text-slate-600">
+                          Run #{runIndexByMessageId.get(event.messageId) ?? "-"} · {event.agentName || "Agent"} · {event.type}
+                        </p>
+                        <p className="mt-1 whitespace-pre-wrap text-xs text-slate-600">{event.content}</p>
+                        <p className="mt-1 truncate text-[10px] text-slate-400">{event.messagePreview || "-"}</p>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-xs text-slate-400">暂无事件</p>
+                  )}
+                </div>
+              </section>
+            ) : null}
+
+            {inspectorTab === "state" ? (
+              <section className="space-y-3">
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-600">Session State</p>
+                  <pre className="max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-900 p-2 text-[11px] leading-5 text-slate-100">
+                    {inspectorStateJson}
+                  </pre>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-600">Selected Message</p>
+                  {selectedMessageJson ? (
+                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-900 p-2 text-[11px] leading-5 text-slate-100">
+                      {selectedMessageJson}
+                    </pre>
+                  ) : (
+                    <p className="text-xs text-slate-400">点击中间任意 agent 回复可查看原始消息结构。</p>
+                  )}
+                </div>
+              </section>
+            ) : null}
+
+            {inspectorTab === "artifacts" ? (
+              <section className="space-y-3">
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-600">DrawIO Artifact</p>
+                  {drawioArtifactSummary.hasArtifact ? (
+                    <div className="space-y-1 text-xs text-slate-500">
+                      <p>Nodes: {drawioArtifactSummary.vertexCount}</p>
+                      <p>Edges: {drawioArtifactSummary.edgeCount}</p>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-400">暂无 draw.io XML 产物。</p>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="mb-1 text-xs font-semibold text-slate-600">Render Mode</p>
+                  <p className="text-xs text-slate-500">draw.io 预览已改为在对话消息下方直接渲染。</p>
+                </div>
+
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <p className="mb-2 text-xs font-semibold text-slate-600">XML Snapshot</p>
+                  <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-900 p-2 text-[11px] leading-5 text-slate-100">
+                    {drawioXml || "No XML artifact."}
+                  </pre>
+                </div>
+              </section>
+            ) : null}
+          </div>
+        </aside>
       </div>
     </div>
   );

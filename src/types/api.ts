@@ -15,6 +15,11 @@ export interface CreateSessionRequestDTO {
   userId: string;
 }
 
+export interface DeleteSessionRequestDTO {
+  sessionId: string;
+  userId: string;
+}
+
 export interface UserRegisterRequestDTO {
   userId: string;
   password: string;

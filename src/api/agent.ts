@@ -17,6 +17,7 @@ import type {
   ChatStreamEventResponseDTO,
   CreateSessionRequestDTO,
   CreateSessionResponseDTO,
+  DeleteSessionRequestDTO,
   SessionHistoryMessageResponseDTO,
   SessionHistorySummaryResponseDTO,
   UserAuthResponseDTO,
@@ -218,6 +219,13 @@ export const agentService = {
 
   createSession(payload: CreateSessionRequestDTO) {
     return request<CreateSessionResponseDTO>(buildApiUrl("/create_session"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteSession(payload: DeleteSessionRequestDTO) {
+    return request<boolean>(buildApiUrl("/delete_session"), {
       method: "POST",
       body: JSON.stringify(payload),
     });
