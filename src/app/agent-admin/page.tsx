@@ -1,4 +1,9 @@
-"use client";
+﻿"use client";
+
+/**
+ * Agent 管理页面：支持查询、编辑与保存 Agent 配置。
+ */
+
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -163,7 +168,7 @@ function AgentAdminPageContent() {
   };
 
   const handleCreate = async () => {
-    const agentId = form.agentId.trim();
+    const agentId = (form.agentId ?? "").trim();
     if (!agentId) {
       showNotice("error", "agentId is required");
       return;
@@ -194,7 +199,7 @@ function AgentAdminPageContent() {
   };
 
   const handleUpdate = async () => {
-    const agentId = form.agentId.trim();
+    const agentId = (form.agentId ?? "").trim();
     if (!agentId) {
       showNotice("error", "agentId is required");
       return;

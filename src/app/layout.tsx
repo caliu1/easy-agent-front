@@ -1,3 +1,7 @@
+﻿/**
+ * 应用根布局：定义全局元信息与基础页面骨架。
+ */
+
 import type { Metadata } from "next";
 import Script from "next/script";
 import "./globals.css";

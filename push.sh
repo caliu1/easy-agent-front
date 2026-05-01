@@ -3,7 +3,7 @@ export REGISTRY="crpi-ba7wjcrt7x2afxv7.cn-hangzhou.personal.cr.aliyuncs.com"   #
 export NAMESPACE="aliyun_caliu"
 #export BACKEND_REPO="easy-agent-backend"
 export FRONTEND_REPO="easy-agent-frontend"
-export TAG="1.3"
+export TAG="1.4.1"
 
 
 
@@ -12,7 +12,7 @@ export TAG="1.3"
 #docker tag easy-agent/backend:latest  "$REGISTRY/$NAMESPACE/$BACKEND_REPO:$TAG"
 #docker tag easy-agent/backend:latest  "$REGISTRY/$NAMESPACE/$BACKEND_REPO:latest"
 
-docker tag easy-agent/frontend:"$TAG" "$REGISTRY/$NAMESPACE/$FRONTEND_REPO:$TAG"
+docker tag easy-agent-front:"latest" "$REGISTRY/$NAMESPACE/$FRONTEND_REPO:$TAG"
 #docker tag easy-agent/frontend:latest "$REGISTRY/$NAMESPACE/$FRONTEND_REPO:latest"
 
 # ===== 4) 推送 =====

@@ -1,9 +1,24 @@
 ﻿"use client";
 
-import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+/**
+ * 聊天页面：负责会话列表、消息流、事件轨迹与 draw.io 面板渲染。
+ */
+import { Suspense, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { DrawIoEmbed } from "react-drawio";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Activity, Bot, Home, LogOut, Send, Settings, Trash2, User, Workflow } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  ChevronLeft,
+  ChevronRight,
+  GripVertical,
+  Home,
+  LogOut,
+  Send,
+  Trash2,
+  User,
+  Workflow,
+} from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
 import type {
@@ -74,6 +89,7 @@ const UNICODE_ESCAPE_REGEX = /\\u[0-9a-fA-F]{4}/;
 const DRAWIO_AGENT_NAME_REGEX = /draw\s*\.?\s*io/i;
 const DRAWIO_AGENT_ID_FALLBACK = new Set(["100120"]);
 const HISTORY_EVENT_MARKER = "[[AGENT_HISTORY_EVENT]]";
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 interface PersistedHistoryEvent {
   type: string;
@@ -190,6 +206,12 @@ function HomePageContent() {
   const preferredAgentId = searchParams.get("agentId")?.trim() ?? "";
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const paneResizeRef = useRef<{ side: "left" | "right"; startX: number; startWidth: number } | null>(null);
+  const drawioResizeRef = useRef<{
+    side: "top" | "bottom";
+    startY: number;
+    startHeight: number;
+  } | null>(null);
 
   const [agentList, setAgentList] = useState<AiAgentConfigResponseDTO[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
@@ -205,6 +227,11 @@ function HomePageContent() {
   const [selectedMessageId, setSelectedMessageId] = useState("");
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("events");
   const [selectedInspectorEventIdx, setSelectedInspectorEventIdx] = useState(0);
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState(288);
+  const [rightInspectorWidth, setRightInspectorWidth] = useState(380);
+  const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(false);
+  const [rightInspectorCollapsed, setRightInspectorCollapsed] = useState(false);
+  const [drawioPanelHeight, setDrawioPanelHeight] = useState(640);
 
   const drawioAgentIdSet = useMemo(() => {
     const set = new Set<string>();
@@ -479,30 +506,54 @@ function HomePageContent() {
     nextXml?: string,
   ) => {
     setMessages((prev) => {
-      const existed = prev.some((m) => m.id === messageId);
-      if (existed) {
-        return prev.map((m) => (m.id === messageId ? { ...m, content, drawioXml: nextXml ?? m.drawioXml } : m));
+      const index = prev.findIndex((m) => m.id === messageId);
+      if (index >= 0) {
+        const current = prev[index];
+        const nextDrawioXml = nextXml ?? current.drawioXml;
+        if (current.content === content && current.drawioXml === nextDrawioXml) {
+          return prev;
+        }
+        const next = [...prev];
+        next[index] = { ...current, content, drawioXml: nextDrawioXml };
+        return next;
       }
       return [...prev, { id: messageId, role: "agent", content, traceEvents: [], drawioXml: nextXml }];
     });
     setConversations((prev) => {
+      let changed = false;
       const next = prev.map((c) => {
         if (c.id !== convId) return c;
 
         const existed = c.messages.some((m) => m.id === messageId);
         const appendedMessage: Message = { id: messageId, role: "agent", content, traceEvents: [], drawioXml: nextXml };
         const nextMessages = existed
-          ? c.messages.map((m) => (m.id === messageId ? { ...m, content, drawioXml: nextXml ?? m.drawioXml } : m))
-          : [...c.messages, appendedMessage];
+          ? c.messages.map((m) => {
+              if (m.id !== messageId) return m;
+              const nextDrawioXml = nextXml ?? m.drawioXml;
+              if (m.content === content && m.drawioXml === nextDrawioXml) {
+                return m;
+              }
+              changed = true;
+              return { ...m, content, drawioXml: nextDrawioXml };
+            })
+          : (() => {
+              changed = true;
+              return [...c.messages, appendedMessage];
+            })();
+
+        const nextConversationDrawio = nextXml ?? c.drawioXml;
+        if (c.drawioXml !== nextConversationDrawio) {
+          changed = true;
+        }
 
         return {
           ...c,
-          drawioXml: nextXml ?? c.drawioXml,
+          drawioXml: nextConversationDrawio,
           messages: nextMessages,
           updatedAt: Date.now(),
         };
       });
-      return next;
+      return changed ? next : prev;
     });
     if (nextXml !== undefined) {
       setDrawioXml(nextXml);
@@ -510,16 +561,27 @@ function HomePageContent() {
   };
 
   const appendAgentMessage = (convId: string, message: Message) => {
-    setMessages((prev) => [...prev, message]);
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === message.id)) {
+        return prev;
+      }
+      return [...prev, message];
+    });
     setConversations((prev) => {
-      return prev.map((c) => {
+      let changed = false;
+      const next = prev.map((c) => {
         if (c.id !== convId) return c;
+        if (c.messages.some((m) => m.id === message.id)) {
+          return c;
+        }
+        changed = true;
         return {
           ...c,
           messages: [...c.messages, message],
           updatedAt: Date.now(),
         };
       });
+      return changed ? next : prev;
     });
   };
 
@@ -544,39 +606,27 @@ function HomePageContent() {
   };
 
   const appendMessageTrace = (
-    convId: string,
+    _convId: string,
     messageId: string,
     thought: ThoughtEvent,
     options?: { mergeWithLast?: boolean },
   ) => {
     const mergeWithLast = options?.mergeWithLast ?? false;
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId
-          ? {
-              ...m,
-              traceEvents: mergeTraceEvents(m.traceEvents ?? [], thought, mergeWithLast),
-            }
-          : m,
-      ),
-    );
+    if (!thought.content?.trim()) return;
 
-    setConversations((prev) => {
-      return prev.map((c) => {
-        if (c.id !== convId) return c;
-        return {
-          ...c,
-          messages: c.messages.map((m) =>
-            m.id === messageId
-              ? {
-                  ...m,
-                  traceEvents: mergeTraceEvents(m.traceEvents ?? [], thought, mergeWithLast),
-                }
-              : m,
-          ),
-          updatedAt: Date.now(),
-        };
-      });
+    setMessages((prev) => {
+      const index = prev.findIndex((m) => m.id === messageId);
+      if (index < 0) {
+        return prev;
+      }
+      const current = prev[index];
+      const nextTraceEvents = mergeTraceEvents(current.traceEvents ?? [], thought, mergeWithLast);
+      const next = [...prev];
+      next[index] = {
+        ...current,
+        traceEvents: nextTraceEvents,
+      };
+      return next;
     });
   };
 
@@ -597,15 +647,24 @@ function HomePageContent() {
       // ignore parse failures and fallback to original content
     }
 
-    const xmlMatch = responseContent
+    const normalizedContent = responseContent
       .replace(/\\"/g, '"')
       .replace(/\\n/g, "\n")
-      .match(/(<mxfile[\s\S]*?<\/mxfile>|<mxGraphModel[\s\S]*?<\/mxGraphModel>)/);
+      .trim();
+    const xmlMatch = normalizedContent.match(/(<mxfile[\s\S]*?<\/mxfile>|<mxGraphModel[\s\S]*?<\/mxGraphModel>)/);
     if (responseType === "drawio" || xmlMatch) {
+      const xml = xmlMatch?.[1] ?? normalizedContent;
+      const textWithoutXml = xmlMatch ? normalizedContent.replace(xml, "") : "";
+      const replyText = textWithoutXml
+        .replace(/```xml\s*/gi, "")
+        .replace(/```\s*/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
       return {
         type: "drawio",
-        content: "Here is the generated diagram:",
-        xml: xmlMatch?.[1] ?? responseContent,
+        content: replyText || "Here is the generated diagram:",
+        xml,
       };
     }
 
@@ -904,6 +963,28 @@ function HomePageContent() {
     }
   };
 
+  const startPaneResize = (side: "left" | "right", event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    paneResizeRef.current = {
+      side,
+      startX: event.clientX,
+      startWidth: side === "left" ? leftSidebarWidth : rightInspectorWidth,
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+  };
+
+  const startDrawioResize = (side: "top" | "bottom", event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    drawioResizeRef.current = {
+      side,
+      startY: event.clientY,
+      startHeight: drawioPanelHeight,
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "row-resize";
+  };
+
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isSending || !selectedAgentId || !userId) return;
 
@@ -955,6 +1036,8 @@ function HomePageContent() {
       let finalContent = "";
       let sawFinal = false;
       let finalMessageId = botMsgId;
+      const pendingStreamEvents: ChatStreamEventResponseDTO[] = [];
+      let flushScheduled = false;
 
       const startNextAgentMessage = () => {
         const nextMsgId = `${Date.now()}-${Math.random()}`;
@@ -970,6 +1053,74 @@ function HomePageContent() {
         activeAgentMessageId = nextMsgId;
       };
 
+      const processStreamEvent = (streamEvent: ChatStreamEventResponseDTO) => {
+        const eventType = streamEvent.type?.toLowerCase();
+
+        const isBoundaryEvent = eventType !== "reply" && eventType !== "final";
+        const boundaryHasPayload =
+          eventType === "route" ||
+          eventType === "thinking" ||
+          (streamEvent.content ?? "").trim().length > 0;
+        if (isBoundaryEvent && boundaryHasPayload && activeReplyContent.trim()) {
+          startNextAgentMessage();
+          activeReplyContent = "";
+        }
+
+        appendStreamThought(currentSessionId, activeAgentMessageId, streamEvent);
+
+        if (eventType !== "reply" && eventType !== "final") return;
+
+        const chunk = streamEvent.content ?? "";
+        if (streamEvent.partial) {
+          activeReplyContent += chunk;
+        } else {
+          activeReplyContent = activeReplyContent ? `${activeReplyContent}${chunk}` : chunk;
+        }
+
+        const normalizedReply = normalizePotentialMojibake(activeReplyContent);
+        const previewParsed = parseResponse({ content: normalizedReply });
+        const previewText = previewParsed.type === "drawio"
+          ? (previewParsed.content?.trim() || "正在生成图，请稍候...")
+          : (normalizedReply.trim() || "Main agent is composing a reply...");
+        replaceAgentMessage(
+          currentSessionId,
+          activeAgentMessageId,
+          previewText,
+          previewParsed.type === "drawio" ? previewParsed.xml : undefined,
+        );
+
+        if (eventType === "reply") {
+          return;
+        }
+
+        sawFinal = true;
+        finalContent = normalizedReply;
+        finalMessageId = activeAgentMessageId;
+      };
+
+      const flushPendingStreamEvents = () => {
+        flushScheduled = false;
+        if (!pendingStreamEvents.length) return;
+        const batch = pendingStreamEvents.splice(0, pendingStreamEvents.length);
+        for (const streamEvent of batch) {
+          processStreamEvent(streamEvent);
+        }
+      };
+
+      const scheduleFlushPendingStreamEvents = () => {
+        if (flushScheduled) return;
+        flushScheduled = true;
+        if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+          window.requestAnimationFrame(() => {
+            flushPendingStreamEvents();
+          });
+        } else {
+          setTimeout(() => {
+            flushPendingStreamEvents();
+          }, 16);
+        }
+      };
+
       await agentService.chatStream(
         {
           agentId: currentAgentId,
@@ -978,45 +1129,13 @@ function HomePageContent() {
           message: text,
         },
         (streamEvent) => {
-          const eventType = streamEvent.type?.toLowerCase();
-
-          const isBoundaryEvent = eventType !== "reply" && eventType !== "final";
-          const boundaryHasPayload =
-            eventType === "route" ||
-            eventType === "thinking" ||
-            (streamEvent.content ?? "").trim().length > 0;
-          if (isBoundaryEvent && boundaryHasPayload && activeReplyContent.trim()) {
-            startNextAgentMessage();
-            activeReplyContent = "";
-          }
-
-          appendStreamThought(currentSessionId, activeAgentMessageId, streamEvent);
-
-          if (eventType !== "reply" && eventType !== "final") return;
-
-          const chunk = streamEvent.content ?? "";
-          if (streamEvent.partial) {
-            activeReplyContent += chunk;
-          } else {
-            activeReplyContent = activeReplyContent ? `${activeReplyContent}${chunk}` : chunk;
-          }
-
-          const normalizedReply = normalizePotentialMojibake(activeReplyContent);
-          const previewText = normalizedReply.trim() || "Main agent is composing a reply...";
-          replaceAgentMessage(currentSessionId, activeAgentMessageId, previewText);
-
-          if (eventType === "reply") {
-            // 不按 non-partial 直接切段，避免单智能体被模型分片拆成多条消息。
-            // 切段交给上面的“阶段边界事件”逻辑处理。
-            return;
-          }
-
-          sawFinal = true;
-          finalContent = normalizedReply;
-          finalMessageId = activeAgentMessageId;
+          pendingStreamEvents.push(streamEvent);
+          scheduleFlushPendingStreamEvents();
         },
         streamAbortRef.current.signal,
       );
+
+      flushPendingStreamEvents();
 
       if (!sawFinal || !finalContent.trim()) {
         replaceAgentMessage(currentSessionId, activeAgentMessageId, "This round ended without a final main-agent reply. Please retry.");
@@ -1056,18 +1175,6 @@ function HomePageContent() {
     if (created) {
       await loadSessionHistoryList(userId, defaultConversationAgentId, created);
     }
-  };
-
-  const handleSwitchAgent = async (nextAgentId: string) => {
-    if (!nextAgentId || !userId || nextAgentId === selectedAgentId) return;
-    streamAbortRef.current?.abort();
-    setSelectedAgentId(nextAgentId);
-    setSessionId("");
-    setActiveConvId("");
-    setMessages([]);
-    setDrawioXml("");
-    setSelectedMessageId("");
-    await loadSessionHistoryList(userId, nextAgentId);
   };
 
   const handleSelectConversation = async (id: string) => {
@@ -1207,6 +1314,49 @@ function HomePageContent() {
   }, [inspectorEvents]);
 
   useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (paneResizeRef.current) {
+        const { side, startX, startWidth } = paneResizeRef.current;
+        const deltaX = event.clientX - startX;
+        if (side === "left") {
+          setLeftSidebarWidth(clamp(startWidth + deltaX, 240, 520));
+        } else {
+          setRightInspectorWidth(clamp(startWidth - deltaX, 300, 720));
+        }
+      }
+
+      if (drawioResizeRef.current) {
+        const { side, startY, startHeight } = drawioResizeRef.current;
+        const deltaY = event.clientY - startY;
+        const nextHeight = side === "top" ? startHeight - deltaY : startHeight + deltaY;
+        setDrawioPanelHeight(clamp(nextHeight, 320, 1400));
+      }
+    };
+
+    const stopResize = () => {
+      if (!paneResizeRef.current && !drawioResizeRef.current) {
+        return;
+      }
+      paneResizeRef.current = null;
+      drawioResizeRef.current = null;
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopResize);
+    window.addEventListener("mouseleave", stopResize);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopResize);
+      window.removeEventListener("mouseleave", stopResize);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       streamAbortRef.current?.abort();
     };
@@ -1227,36 +1377,12 @@ function HomePageContent() {
           </div>
 
           <div className="flex items-center gap-2">
-            <div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 md:flex">
-              <label className="text-xs font-medium text-slate-500">Agent</label>
-              <select
-                value={selectedAgentId}
-                onChange={(event) => {
-                  void handleSwitchAgent(event.target.value);
-                }}
-                className="max-w-56 truncate bg-transparent text-sm text-slate-700 outline-none"
-              >
-                {agentList.map((agent) => (
-                  <option key={agent.agentId} value={agent.agentId}>
-                    {agent.agentName}
-                  </option>
-                ))}
-              </select>
-            </div>
-
             <button
               onClick={() => router.push("/")}
               className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
             >
               <Home size={14} />
               EasyAgent
-            </button>
-            <button
-              onClick={() => router.push("/agent-admin")}
-              className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-100"
-            >
-              <Settings size={14} />
-              Admin
             </button>
             <button onClick={handleLogout} className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-rose-500">
               <LogOut size={18} />
@@ -1266,48 +1392,83 @@ function HomePageContent() {
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-72 flex-col border-r border-slate-200 bg-white">
-          <div className="border-b border-slate-200 px-3 py-3">
+        {leftSidebarCollapsed ? (
+          <aside className="flex w-10 shrink-0 flex-col border-r border-slate-200 bg-white">
             <button
-              className="w-full rounded-lg bg-blue-600 py-2 text-sm font-medium text-white hover:bg-blue-700"
-              onClick={handleCreateNewConversation}
+              onClick={() => setLeftSidebarCollapsed(false)}
+              className="m-1.5 inline-flex h-8 items-center justify-center rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100"
+              title="展开会话栏"
             >
-              新建会话
+              <ChevronRight size={16} />
             </button>
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {visibleConversations.map((conv) => (
-              <div
-                key={conv.id}
-                onClick={() => void handleSelectConversation(conv.id)}
-                className={`cursor-pointer border-b border-slate-100 px-3 py-3 ${
-                  activeConvId === conv.id ? "bg-blue-50" : "bg-white hover:bg-slate-50"
-                }`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-slate-800">{conv.title || "Conversation"}</p>
-                    <p className="mt-1 truncate text-[11px] text-slate-500">{conv.sessionId}</p>
-                    <p className="mt-1 text-[11px] text-slate-400">{conv.totalTokens} tokens</p>
-                  </div>
+          </aside>
+        ) : (
+          <>
+            <aside style={{ width: `${leftSidebarWidth}px` }} className="flex shrink-0 flex-col border-r border-slate-200 bg-white">
+              <div className="border-b border-slate-200 px-3 py-3">
+                <div className="mb-2 flex items-start gap-2">
+                  <div className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2 py-2">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Agent</p>
+                  <p className="mt-0.5 truncate text-sm text-slate-700">{selectedAgent?.agentName || "-"}</p>
+                </div>
+                
                   <button
-                    className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void handleDeleteConversation(conv.id);
-                    }}
+                    onClick={() => setLeftSidebarCollapsed(true)}
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 text-slate-500 hover:bg-slate-100"
+                    title="收起会话栏"
                   >
-                    <Trash2 size={14} />
+                    <ChevronLeft size={14} />
                   </button>
                 </div>
+                <button
+                  className="w-full rounded-lg bg-blue-600 py-2 text-sm font-medium text-white hover:bg-blue-700"
+                  onClick={handleCreateNewConversation}
+                >
+                  新建会话
+                </button>
               </div>
-            ))}
-            {visibleConversations.length === 0 ? (
-              <div className="px-4 py-8 text-center text-xs text-slate-400">当前 Agent 暂无会话</div>
-            ) : null}
-          </div>
-        </aside>
+
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                {visibleConversations.map((conv) => (
+                  <div
+                    key={conv.id}
+                    onClick={() => void handleSelectConversation(conv.id)}
+                    className={`cursor-pointer border-b border-slate-100 px-3 py-3 ${
+                      activeConvId === conv.id ? "bg-blue-50" : "bg-white hover:bg-slate-50"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-slate-800">{conv.title || "Conversation"}</p>
+                        <p className="mt-1 truncate text-[11px] text-slate-500">{conv.sessionId}</p>
+                        <p className="mt-1 text-[11px] text-slate-400">{conv.totalTokens} tokens</p>
+                      </div>
+                      <button
+                        className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleDeleteConversation(conv.id);
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {visibleConversations.length === 0 ? (
+                  <div className="px-4 py-8 text-center text-xs text-slate-400">当前 Agent 暂无会话</div>
+                ) : null}
+              </div>
+            </aside>
+            <div
+              onMouseDown={(event) => startPaneResize("left", event)}
+              className="group hidden w-1 shrink-0 cursor-col-resize bg-transparent md:block"
+              title="拖动调整会话栏宽度"
+            >
+              <div className="h-full w-full bg-slate-200/30 transition-colors group-hover:bg-blue-300/70" />
+            </div>
+          </>
+        )}
 
         <main className="flex min-w-0 flex-1 flex-col">
           <div className="border-b border-slate-200 bg-white px-4 py-3">
@@ -1332,7 +1493,7 @@ function HomePageContent() {
 
                 {run.userMessage ? (
                   <div className="mb-2 flex justify-end">
-                    <div className="flex max-w-[88%] flex-row-reverse">
+                    <div className="flex min-w-0 max-w-[88%] flex-row-reverse">
                       <div className="mt-1 shrink-0">
                         <div className="ml-2 flex h-8 w-8 items-center justify-center rounded-full bg-blue-100">
                           <User size={16} className="text-blue-600" />
@@ -1340,7 +1501,9 @@ function HomePageContent() {
                       </div>
                       <div className="rounded-2xl rounded-tr-sm bg-blue-600 px-3 py-2.5 text-sm leading-relaxed text-white">
                         {run.userMessage.content.trim() ? (
-                          <p className="whitespace-pre-wrap">{run.userMessage.content}</p>
+                          <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                            {run.userMessage.content}
+                          </p>
                         ) : (
                           <p className="text-white/70">...</p>
                         )}
@@ -1354,7 +1517,7 @@ function HomePageContent() {
                     const hasDiagram = isDrawioSession && Boolean(msg.drawioXml);
                     return (
                     <div key={msg.id} className="flex justify-start">
-                      <div className={`flex flex-row ${hasDiagram ? "w-full" : "max-w-[92%]"}`}>
+                      <div className={`flex min-w-0 flex-row ${hasDiagram ? "w-full" : "max-w-[92%]"}`}>
                         <div className="mt-1 shrink-0">
                           <div className="mr-2 flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-slate-100">
                             <Bot size={16} className="text-slate-600" />
@@ -1375,7 +1538,7 @@ function HomePageContent() {
                         >
                           {streamingAgentMessageId === msg.id || (msg.traceEvents?.length ?? 0) > 0 ? (
                             streamingAgentMessageId === msg.id ? (
-                              <div className="mb-2 max-h-[3.75rem] overflow-hidden whitespace-pre-wrap rounded-lg bg-slate-100 px-2 py-1 text-xs leading-5 text-slate-500">
+                              <div className="mb-2 max-h-[3.75rem] overflow-hidden whitespace-pre-wrap break-words rounded-lg bg-slate-100 px-2 py-1 text-xs leading-5 text-slate-500 [overflow-wrap:anywhere]">
                                 {buildThoughtPreview(msg.traceEvents ?? [])}
                               </div>
                             ) : (
@@ -1389,7 +1552,10 @@ function HomePageContent() {
                                 </summary>
                                 <div className="mt-2 max-h-44 space-y-2 overflow-y-auto rounded-lg bg-slate-100 p-2">
                                   {(msg.traceEvents ?? []).map((event) => (
-                                    <p key={event.id} className="whitespace-pre-wrap text-xs leading-5 text-slate-600">
+                                    <p
+                                      key={event.id}
+                                      className="whitespace-pre-wrap break-words text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]"
+                                    >
                                       {event.type === "route" ? "[route] " : ""}
                                       {event.content}
                                     </p>
@@ -1400,18 +1566,42 @@ function HomePageContent() {
                           ) : null}
 
                           {msg.content.trim() ? (
-                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                            <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{msg.content}</p>
                           ) : (
                             <p className="text-xs text-slate-400">Waiting for response...</p>
                           )}
 
                           {hasDiagram ? (
-                            <div className="mt-2 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-                              <div className="h-[28rem] w-full md:h-[48rem]">
-                                <DrawIoEmbed
-                                  urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }}
-                                  xml={msg.drawioXml}
+                            <div className="mt-2 flex justify-start">
+                              <div
+                                data-drawio-panel="true"
+                                className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
+                                style={{ width: "100%" }}
+                              >
+                                <div className="w-full" style={{ height: `${drawioPanelHeight}px` }}>
+                                  <DrawIoEmbed
+                                    urlParameters={{ ui: "kennedy", spin: true, libraries: true, saveAndExit: true }}
+                                    xml={msg.drawioXml}
+                                  />
+                                </div>
+
+                                <div
+                                  onMouseDown={(event) => startDrawioResize("top", event)}
+                                  className="absolute inset-x-0 top-0 z-10 h-2 cursor-row-resize hover:bg-blue-200/40"
+                                  title="向上/向下拖动调整高度"
                                 />
+                                <div
+                                  onMouseDown={(event) => startDrawioResize("bottom", event)}
+                                  className="absolute inset-x-0 bottom-0 z-10 h-2 cursor-row-resize hover:bg-blue-200/40"
+                                  title="向上/向下拖动调整高度"
+                                />
+
+                                <div className="pointer-events-none absolute bottom-2 right-2 z-10 rounded bg-white/75 px-1 py-0.5 text-[10px] text-slate-500">
+                                  <span className="inline-flex items-center gap-1">
+                                    <GripVertical size={10} className="rotate-90" />
+                                    拖拽上下边缘调高度
+                                  </span>
+                                </div>
                               </div>
                             </div>
                           ) : null}
@@ -1427,11 +1617,12 @@ function HomePageContent() {
           </div>
 
           <div className="border-t border-slate-200 bg-white p-3">
-            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+            <div className="flex min-w-0 items-center gap-2 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
               <input
-                className="flex-1 bg-transparent text-sm text-slate-700 outline-none"
+                className="min-w-0 w-0 flex-1 bg-transparent text-sm text-slate-700 outline-none"
                 placeholder="请输入你的问题..."
                 value={inputValue}
+                spellCheck={false}
                 onChange={(event) => setInputValue(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
@@ -1454,49 +1645,82 @@ function HomePageContent() {
           </div>
         </main>
 
-        <aside className="hidden w-[380px] flex-col border-l border-slate-200 bg-white xl:flex">
-          <div className="border-b border-slate-200 px-4 py-3">
-            <p className="text-sm font-semibold text-slate-800">Run Inspector</p>
-            <p className="mt-1 text-xs text-slate-500">参考 ADK Dev UI 的事件与状态视图</p>
-          </div>
-
-          <div className="border-b border-slate-200 px-4 py-2">
-            <div className="grid grid-cols-3 gap-2 text-xs">
-              <button
-                onClick={() => setInspectorTab("events")}
-                className={`rounded-md px-2 py-1.5 ${
-                  inspectorTab === "events"
-                    ? "bg-blue-600 text-white"
-                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                }`}
-              >
-                Events
-              </button>
-              <button
-                onClick={() => setInspectorTab("state")}
-                className={`rounded-md px-2 py-1.5 ${
-                  inspectorTab === "state"
-                    ? "bg-blue-600 text-white"
-                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                }`}
-              >
-                State
-              </button>
-              <button
-                onClick={() => setInspectorTab("artifacts")}
-                disabled={!isDrawioSession}
-                className={`rounded-md px-2 py-1.5 ${
-                  inspectorTab === "artifacts"
-                    ? "bg-blue-600 text-white"
-                    : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                } ${!isDrawioSession ? "cursor-not-allowed opacity-40" : ""}`}
-              >
-                Artifacts
-              </button>
+        {rightInspectorCollapsed ? (
+          <aside className="hidden w-10 shrink-0 flex-col border-l border-slate-200 bg-white xl:flex">
+            <button
+              onClick={() => setRightInspectorCollapsed(false)}
+              className="m-1.5 inline-flex h-8 items-center justify-center rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100"
+              title="展开右侧面板"
+            >
+              <ChevronLeft size={16} />
+            </button>
+          </aside>
+        ) : (
+          <>
+            <div
+              onMouseDown={(event) => startPaneResize("right", event)}
+              className="group hidden w-1 shrink-0 cursor-col-resize bg-transparent xl:block"
+              title="拖动调整右侧面板宽度"
+            >
+              <div className="h-full w-full bg-slate-200/30 transition-colors group-hover:bg-blue-300/70" />
             </div>
-          </div>
+            <aside
+              style={{ width: `${rightInspectorWidth}px` }}
+              className="hidden shrink-0 flex-col border-l border-slate-200 bg-white xl:flex"
+            >
+              <div className="border-b border-slate-200 px-4 py-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-800">Run Inspector</p>
+                    <p className="mt-1 text-xs text-slate-500">参考 ADK Dev UI 的事件与状态视图</p>
+                  </div>
+                  <button
+                    onClick={() => setRightInspectorCollapsed(true)}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-slate-500 hover:bg-slate-100"
+                    title="收起右侧面板"
+                  >
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
+              </div>
 
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+              <div className="border-b border-slate-200 px-4 py-2">
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <button
+                    onClick={() => setInspectorTab("events")}
+                    className={`rounded-md px-2 py-1.5 ${
+                      inspectorTab === "events"
+                        ? "bg-blue-600 text-white"
+                        : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    Events
+                  </button>
+                  <button
+                    onClick={() => setInspectorTab("state")}
+                    className={`rounded-md px-2 py-1.5 ${
+                      inspectorTab === "state"
+                        ? "bg-blue-600 text-white"
+                        : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    State
+                  </button>
+                  <button
+                    onClick={() => setInspectorTab("artifacts")}
+                    disabled={!isDrawioSession}
+                    className={`rounded-md px-2 py-1.5 ${
+                      inspectorTab === "artifacts"
+                        ? "bg-blue-600 text-white"
+                        : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                    } ${!isDrawioSession ? "cursor-not-allowed opacity-40" : ""}`}
+                  >
+                    Artifacts
+                  </button>
+                </div>
+              </div>
+
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
             <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
               <p className="mb-2 text-xs font-semibold text-slate-600">当前会话</p>
               <p className="truncate text-xs text-slate-500">Agent: {selectedAgent?.agentName || "-"}</p>
@@ -1636,7 +1860,9 @@ function HomePageContent() {
                         <p className="text-[11px] font-medium text-slate-600">
                           Run #{runIndexByMessageId.get(event.messageId) ?? "-"} · {event.agentName || "Agent"} · {event.type}
                         </p>
-                        <p className="mt-1 whitespace-pre-wrap text-xs text-slate-600">{event.content}</p>
+                        <p className="mt-1 whitespace-pre-wrap break-words text-xs text-slate-600 [overflow-wrap:anywhere]">
+                          {event.content}
+                        </p>
                         <p className="mt-1 truncate text-[10px] text-slate-400">{event.messagePreview || "-"}</p>
                       </div>
                     ))
@@ -1695,8 +1921,10 @@ function HomePageContent() {
                 </div>
               </section>
             ) : null}
-          </div>
-        </aside>
+              </div>
+            </aside>
+          </>
+        )}
       </div>
     </div>
   );

@@ -1,3 +1,7 @@
+﻿/**
+ * Cookie 工具：封装登录态与令牌的读写清理。
+ */
+
 import Cookies from "js-cookie";
 
 const COOKIE_KEYS = {

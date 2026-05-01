@@ -1,10 +1,16 @@
 ﻿"use client";
 
+/**
+ * Agent 创建页面：通过表单与 AI 辅助快速生成配置。
+ */
+
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Loader2, Plus, Send, Sparkles, Trash2 } from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
+import type { AgentMcpProfileResponseDTO, AgentSkillProfileResponseDTO } from "@/types/api";
 
 const SUCCESS_CODE = "0000";
 const DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/";
@@ -16,6 +22,9 @@ const CONFIG_WRITER_AGENT_NAME = "agentConfigWriterAgent";
 
 const CJK_REGEX = /[\u4E00-\u9FFF]/;
 const UNICODE_ESCAPE_REGEX = /\\u[0-9a-fA-F]{4}/;
+const RUNTIME_IDENTIFIER_REGEX = /^_?[a-zA-Z0-9]*([. _-][a-zA-Z0-9]+)*$/;
+const RUNTIME_IDENTIFIER_INVALID_CHAR_REGEX = /[^a-zA-Z0-9._ -]/g;
+const RUNTIME_IDENTIFIER_LIST_INVALID_CHAR_REGEX = /[^a-zA-Z0-9._ -,\n\r]/g;
 
 type Notice = {
   type: "success" | "error" | "info";
@@ -38,8 +47,42 @@ type WorkflowItem = {
   maxIterations: string;
 };
 
+type McpTransportType = "sse" | "streamableHttp";
+
+type ToolMcpItem = {
+  type: McpTransportType;
+  name: string;
+  baseUri: string;
+  endpoint: string;
+  requestTimeout: string;
+  authType?: string;
+  authToken?: string;
+  authKeyName?: string;
+  headersJson?: string;
+  queryJson?: string;
+};
+
+type SkillAssetItem = {
+  id: string;
+  kind: "file" | "folder";
+  path: string;
+  content: string;
+};
+
+type ToolSkillItem = {
+  type: string;
+  rootFolder: string;
+  path: string;
+  pathsText: string;
+  expanded: boolean;
+  assets: SkillAssetItem[];
+  selectedAssetId: string;
+  assetsDirty: boolean;
+  newFilePath: string;
+  newFolderPath: string;
+};
+
 type CreateForm = {
-  agentId: string;
   appName: string;
   agentName: string;
   agentDesc: string;
@@ -51,11 +94,15 @@ type CreateForm = {
   runnerAgentName: string;
   pluginNameListText: string;
   autoPublish: boolean;
+  toolMcpList: ToolMcpItem[];
+  toolSkillsList: ToolSkillItem[];
   agents: AgentItem[];
   agentWorkflows: WorkflowItem[];
 };
 
-type CreateFormPatch = Partial<Omit<CreateForm, "agents" | "agentWorkflows">> & {
+type CreateFormPatch = Partial<Omit<CreateForm, "agents" | "agentWorkflows" | "toolMcpList" | "toolSkillsList">> & {
+  toolMcpList?: ToolMcpItem[];
+  toolSkillsList?: ToolSkillItem[];
   agents?: AgentItem[];
   agentWorkflows?: WorkflowItem[];
 };
@@ -85,8 +132,99 @@ const createEmptyWorkflowItem = (): WorkflowItem => ({
   maxIterations: "3",
 });
 
+const createSkillAssetId = (): string => {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const DEFAULT_SKILL_MARKDOWN_TEMPLATE = `---
+name: my-skill
+description: 技能描述
+---
+
+# Skill
+
+在这里编写技能说明。`;
+
+const createDefaultSkillMarkdownAsset = (): SkillAssetItem => ({
+  id: createSkillAssetId(),
+  kind: "file",
+  path: "SKILL.md",
+  content: DEFAULT_SKILL_MARKDOWN_TEMPLATE,
+});
+
+const normalizeMcpTransportType = (type?: string): McpTransportType => {
+  return type === "streamableHttp" ? "streamableHttp" : "sse";
+};
+
+const buildToolMcpFromProfile = (profile: AgentMcpProfileResponseDTO): ToolMcpItem => ({
+  type: normalizeMcpTransportType(profile.type),
+  name: profile.name || "",
+  baseUri: profile.baseUri || "",
+  endpoint: profile.sseEndpoint || "",
+  requestTimeout: String(profile.requestTimeout ?? 3000),
+  authType: profile.authType || "",
+  authToken: profile.authToken || "",
+  authKeyName: profile.authKeyName || "",
+  headersJson: profile.headersJson || "",
+  queryJson: profile.queryJson || "",
+});
+
+const buildToolSkillFromProfile = (profile: AgentSkillProfileResponseDTO): ToolSkillItem => {
+  const defaultSkillAsset = createDefaultSkillMarkdownAsset();
+  const normalizedPath = normalizeSkillPath(profile.ossPath || "");
+  const normalizedRootFolder = extractSkillRootFolderFromPath(normalizedPath);
+  return {
+    type: "oss",
+    rootFolder: normalizedRootFolder,
+    path: normalizedPath,
+    pathsText: normalizedPath,
+    expanded: false,
+    assets: [defaultSkillAsset],
+    selectedAssetId: defaultSkillAsset.id,
+    assetsDirty: false,
+    newFilePath: "",
+    newFolderPath: "",
+  };
+};
+
+const mcpProfileSignature = (item: Pick<ToolMcpItem, "type" | "name" | "baseUri" | "endpoint">) =>
+  [
+    normalizeMcpTransportType(item.type),
+    item.name.trim(),
+    item.baseUri.trim(),
+    item.endpoint.trim(),
+  ].join("::");
+
+const mcpSignatureFromProfile = (profile: AgentMcpProfileResponseDTO) =>
+  [
+    normalizeMcpTransportType(profile.type),
+    (profile.name || "").trim(),
+    (profile.baseUri || "").trim(),
+    (profile.sseEndpoint || "").trim(),
+  ].join("::");
+
+const normalizeSkillPath = (path: string) => path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+const normalizeSkillPathLoose = (path: string) => normalizeSkillPath(path).toLowerCase();
+const SKILL_OSS_PREFIX = "easyagent/skills/";
+
+const extractSkillRootFolderFromPath = (path: string): string => {
+  const normalized = normalizeSkillPath(path);
+  if (normalized.toLowerCase().startsWith(SKILL_OSS_PREFIX)) {
+    const rest = normalized.slice(SKILL_OSS_PREFIX.length);
+    return rest.split("/")[0] ?? "";
+  }
+  if (normalized.toLowerCase().startsWith("oss://")) {
+    const marker = `/${SKILL_OSS_PREFIX}`;
+    const markerIndex = normalized.toLowerCase().indexOf(marker);
+    if (markerIndex >= 0) {
+      const rest = normalized.slice(markerIndex + marker.length);
+      return rest.split("/")[0] ?? "";
+    }
+  }
+  return "";
+};
+
 const INITIAL_FORM: CreateForm = {
-  agentId: "",
   appName: "MyAgentApp",
   agentName: "",
   agentDesc: "",
@@ -98,6 +236,8 @@ const INITIAL_FORM: CreateForm = {
   runnerAgentName: "",
   pluginNameListText: "",
   autoPublish: true,
+  toolMcpList: [],
+  toolSkillsList: [],
   agents: [createEmptyAgentItem()],
   agentWorkflows: [createEmptyWorkflowItem()],
 };
@@ -107,6 +247,87 @@ const parseTextList = (input: string): string[] =>
     .split(/[\n,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+
+const parseJsonMap = (raw: string | undefined): Record<string, string> => {
+  if (!raw || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    const map: Record<string, string> = {};
+    Object.entries(parsed).forEach(([key, value]) => {
+      if (!key.trim()) return;
+      if (typeof value === "string") map[key.trim()] = value;
+      else if (typeof value === "number" || typeof value === "boolean") map[key.trim()] = String(value);
+    });
+    return map;
+  } catch {
+    return {};
+  }
+};
+
+const normalizeSkillRootFolder = (input: string): string => {
+  const normalized = input
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/^easyagent\/skills\//, "");
+  return normalized;
+};
+
+const normalizeOssSkillPath = (rawPath: string, rootFolder: string): string => {
+  const trimmedRaw = rawPath.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const normalizedRoot = normalizeSkillRootFolder(rootFolder);
+
+  if (!trimmedRaw) {
+    return normalizedRoot ? `${SKILL_OSS_PREFIX}${normalizedRoot}` : "";
+  }
+
+  if (trimmedRaw.toLowerCase().startsWith("oss://")) {
+    const marker = `/${SKILL_OSS_PREFIX}`;
+    const markerIndex = trimmedRaw.toLowerCase().indexOf(marker);
+    if (markerIndex < 0) {
+      throw new Error("SKILL 路径必须位于 easyagent/skills/ 下");
+    }
+    return normalizeSkillPath(trimmedRaw.slice(markerIndex + 1));
+  }
+
+  if (trimmedRaw.toLowerCase().startsWith("skills/")) {
+    throw new Error("旧路径 skills/ 已废弃，请使用 easyagent/skills/{skillName}");
+  }
+
+  if (trimmedRaw.startsWith(SKILL_OSS_PREFIX)) {
+    return trimmedRaw;
+  }
+
+  if (!normalizedRoot) {
+    return `${SKILL_OSS_PREFIX}${trimmedRaw}`;
+  }
+
+  if (trimmedRaw === normalizedRoot || trimmedRaw.startsWith(`${normalizedRoot}/`)) {
+    return `${SKILL_OSS_PREFIX}${trimmedRaw}`;
+  }
+
+  return `${SKILL_OSS_PREFIX}${normalizedRoot}/${trimmedRaw}`;
+};
+
+const sanitizeRuntimeIdentifierInput = (value: string): string => {
+  return value
+    .replace(RUNTIME_IDENTIFIER_INVALID_CHAR_REGEX, "")
+    .replace(/[ ]{2,}/g, " ");
+};
+
+const sanitizeRuntimeIdentifierListInput = (value: string): string => {
+  return value
+    .replace(RUNTIME_IDENTIFIER_LIST_INVALID_CHAR_REGEX, "")
+    .replace(/[ ]{2,}/g, " ");
+};
+
+const isValidRuntimeIdentifier = (value: string): boolean => {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (trimmed.toLowerCase() === "user") return false;
+  return RUNTIME_IDENTIFIER_REGEX.test(trimmed);
+};
 
 const decodeUnicodeEscapes = (value: string): string => {
   return value.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => {
@@ -136,10 +357,10 @@ const normalizePotentialMojibake = (value: string): string => {
   return decodedCjkCount >= 2 ? decoded : unicodeNormalized;
 };
 
-const buildConfigJsonFromForm = (form: CreateForm): string => {
+const buildConfigJsonFromForm = (form: CreateForm, existingAgentId?: string): string => {
   const normalizedAgents = form.agents.map((item) => {
     const agent: Record<string, unknown> = {
-      name: item.name.trim(),
+      name: sanitizeRuntimeIdentifierInput(item.name).trim(),
       instruction: item.instruction.trim(),
       description: item.description.trim(),
     };
@@ -150,29 +371,93 @@ const buildConfigJsonFromForm = (form: CreateForm): string => {
   });
 
   const normalizedWorkflows = form.agentWorkflows.map((item) => {
+    const normalizedSubAgents = parseTextList(item.subAgentsText).map((name) =>
+      sanitizeRuntimeIdentifierInput(name).trim(),
+    );
+
     const workflow: Record<string, unknown> = {
       type: item.type,
-      name: item.name.trim(),
+      name: sanitizeRuntimeIdentifierInput(item.name).trim(),
       description: item.description.trim(),
-      subAgents: parseTextList(item.subAgentsText),
+      subAgents: normalizedSubAgents,
       maxIterations: Number(item.maxIterations) > 0 ? Number(item.maxIterations) : 3,
     };
     if (item.routerAgent.trim()) {
-      workflow.routerAgent = item.routerAgent.trim();
+      workflow.routerAgent = sanitizeRuntimeIdentifierInput(item.routerAgent).trim();
     }
     return workflow;
   });
 
   const runnerAgentName =
-    form.runnerAgentName.trim() ||
+    sanitizeRuntimeIdentifierInput(form.runnerAgentName).trim() ||
     normalizedWorkflows[0]?.name?.toString() ||
     normalizedAgents[0]?.name?.toString() ||
     "";
 
+  const normalizedToolMcpList = form.toolMcpList
+    .map((item) => {
+      const requestTimeout = Number(item.requestTimeout);
+      const withTimeout = Number.isInteger(requestTimeout) && requestTimeout > 0;
+
+      const type = normalizeMcpTransportType(item.type);
+      const name = item.name.trim();
+      const baseUri = item.baseUri.trim();
+      if (!name || !baseUri) return null;
+
+      const configPayload: Record<string, unknown> = {
+        name,
+        baseUri,
+      };
+      if (item.endpoint.trim()) {
+        if (type === "streamableHttp") {
+          configPayload.endpoint = item.endpoint.trim();
+        } else {
+          configPayload.sseEndpoint = item.endpoint.trim();
+        }
+      }
+      if (withTimeout) {
+        configPayload.requestTimeout = requestTimeout;
+      }
+      const headers = parseJsonMap(item.headersJson);
+      if (Object.keys(headers).length) {
+        configPayload.headers = headers;
+      }
+      const query = parseJsonMap(item.queryJson);
+      if (Object.keys(query).length) {
+        configPayload.query = query;
+      }
+      const authType = (item.authType || "").trim();
+      if (authType && authType !== "none") {
+        configPayload.auth = {
+          type: authType,
+          token: (item.authToken || "").trim(),
+          keyName: (item.authKeyName || "").trim(),
+        };
+      }
+      if (type === "streamableHttp") {
+        return { streamableHttp: configPayload };
+      }
+      return { sse: configPayload };
+    })
+    .filter((item) => item !== null);
+
+  const normalizedToolSkillsList = form.toolSkillsList.flatMap((item) => {
+    const normalizedRoot = normalizeSkillRootFolder(item.rootFolder || "");
+    if (!normalizedRoot) return [];
+    const normalizedPath = normalizeOssSkillPath(normalizedRoot, normalizedRoot);
+    if (!normalizedPath) return [];
+    return [
+      {
+        type: "oss",
+        path: normalizedPath,
+      },
+    ];
+  });
+
   const config = {
     appName: form.appName.trim(),
     agent: {
-      agentId: form.agentId.trim(),
+      agentId: (existingAgentId ?? "").trim(),
       agentName: form.agentName.trim(),
       agentDesc: form.agentDesc.trim(),
     },
@@ -185,6 +470,8 @@ const buildConfigJsonFromForm = (form: CreateForm): string => {
       },
       chatModel: {
         model: form.model.trim(),
+        toolMcpList: normalizedToolMcpList,
+        toolSkillsList: normalizedToolSkillsList,
       },
       agents: normalizedAgents,
       agentWorkflows: normalizedWorkflows,
@@ -385,7 +672,7 @@ const tryParseProgressiveJson = (value: string): unknown | null => {
 };
   // 兼容多种包裹结构：configJson/data/result/payload/config
 const unwrapConfigObject = (value: unknown, depth = 0): Record<string, unknown> | null => {
-  // 鍏煎澶氱鍖呰９缁撴瀯锛歝onfigJson/data/result/payload/config
+  // 兼容多种包裹结构：configJson/data/result/payload/config
   if (!isRecord(value) || depth > 4) return null;
 
   const rawConfigJson = value.configJson;
@@ -419,7 +706,7 @@ const mapAgentsFromUnknown = (value: unknown): AgentItem[] | undefined => {
       if (!name && !instruction) return null;
 
       return {
-        name: name ?? "",
+        name: sanitizeRuntimeIdentifierInput(name ?? ""),
         description: toNonEmptyString(item.description) ?? toNonEmptyString(item.agentDesc) ?? "",
         instruction: instruction ?? "",
         outputKey: toNonEmptyString(item.outputKey) ?? "",
@@ -445,16 +732,94 @@ const mapWorkflowsFromUnknown = (value: unknown): WorkflowItem[] | undefined => 
 
       return {
         type: normalizeWorkflowType(item.type),
-        name,
+        name: sanitizeRuntimeIdentifierInput(name),
         description: toNonEmptyString(item.description) ?? "",
-        subAgentsText: subAgents.join(","),
-        routerAgent: toNonEmptyString(item.routerAgent) ?? "",
+        subAgentsText: subAgents.map((subAgent) => sanitizeRuntimeIdentifierInput(subAgent)).join(","),
+        routerAgent: sanitizeRuntimeIdentifierInput(toNonEmptyString(item.routerAgent) ?? ""),
         maxIterations: maxIterationsText,
       } satisfies WorkflowItem;
     })
     .filter((item): item is WorkflowItem => item !== null);
 
   return mapped.length ? mapped : [createEmptyWorkflowItem()];
+};
+
+const mapToolMcpFromUnknown = (value: unknown): ToolMcpItem[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+
+  const mapped = value
+    .map((item) => {
+      if (!isRecord(item)) return null;
+
+      const sse = isRecord(item.sse) ? item.sse : null;
+      if (sse) {
+        const sseAuth = isRecord(sse.auth) ? sse.auth : null;
+        const mappedItem: ToolMcpItem = {
+          type: "sse",
+          name: toNonEmptyString(sse.name) ?? "",
+          baseUri: toNonEmptyString(sse.baseUri) ?? "",
+          endpoint: toNonEmptyString(sse.sseEndpoint) ?? "",
+          requestTimeout: toNonEmptyString(sse.requestTimeout) ?? "3000",
+          authType: toNonEmptyString(sseAuth?.type) ?? "",
+          authToken: toNonEmptyString(sseAuth?.token) ?? "",
+          authKeyName: toNonEmptyString(sseAuth?.keyName) ?? "",
+          headersJson: isRecord(sse.headers) ? JSON.stringify(sse.headers) : "",
+          queryJson: isRecord(sse.query) ? JSON.stringify(sse.query) : "",
+        };
+        return mappedItem;
+      }
+
+      const streamableHttp = isRecord(item.streamableHttp) ? item.streamableHttp : null;
+      if (streamableHttp) {
+        const httpAuth = isRecord(streamableHttp.auth) ? streamableHttp.auth : null;
+        const mappedItem: ToolMcpItem = {
+          type: "streamableHttp",
+          name: toNonEmptyString(streamableHttp.name) ?? "",
+          baseUri: toNonEmptyString(streamableHttp.baseUri) ?? "",
+          endpoint: toNonEmptyString(streamableHttp.endpoint) ?? "",
+          requestTimeout: toNonEmptyString(streamableHttp.requestTimeout) ?? "3000",
+          authType: toNonEmptyString(httpAuth?.type) ?? "",
+          authToken: toNonEmptyString(httpAuth?.token) ?? "",
+          authKeyName: toNonEmptyString(httpAuth?.keyName) ?? "",
+          headersJson: isRecord(streamableHttp.headers) ? JSON.stringify(streamableHttp.headers) : "",
+          queryJson: isRecord(streamableHttp.query) ? JSON.stringify(streamableHttp.query) : "",
+        };
+        return mappedItem;
+      }
+
+      return null;
+    })
+    .filter((item): item is ToolMcpItem => item !== null);
+
+  return mapped;
+};
+
+const mapToolSkillsFromUnknown = (value: unknown): ToolSkillItem[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+
+  const mapped = value
+    .map((item) => {
+      if (!isRecord(item)) return null;
+      const path = toNonEmptyString(item.path);
+      if (!path) return null;
+      const rootFolder = extractSkillRootFolderFromPath(path);
+      const defaultSkillAsset = createDefaultSkillMarkdownAsset();
+      return {
+        type: "oss",
+        rootFolder,
+        path,
+        pathsText: path,
+        expanded: false,
+        assets: [defaultSkillAsset],
+        selectedAssetId: defaultSkillAsset.id,
+        assetsDirty: false,
+        newFilePath: "",
+        newFolderPath: "",
+      } as ToolSkillItem;
+    })
+    .filter((item) => item !== null);
+
+  return mapped as ToolSkillItem[];
 };
 
 const buildFormPatchFromUnknown = (value: unknown): CreateFormPatch | null => {
@@ -478,9 +843,6 @@ const buildFormPatchFromUnknown = (value: unknown): CreateFormPatch | null => {
   const appName = toNonEmptyString(root.appName);
   if (appName) patch.appName = appName;
 
-  const agentId = toNonEmptyString(agentNode?.agentId ?? root.agentId);
-  if (agentId) patch.agentId = agentId;
-
   const agentName = toNonEmptyString(agentNode?.agentName ?? root.agentName);
   if (agentName) patch.agentName = agentName;
 
@@ -503,11 +865,27 @@ const buildFormPatchFromUnknown = (value: unknown): CreateFormPatch | null => {
   const model = toNonEmptyString(chatModelNode?.model ?? root.model);
   if (model) patch.model = model;
 
+  const toolMcpList = mapToolMcpFromUnknown(
+    chatModelNode?.toolMcpList ??
+      chatModelNode?.["tool-mcp-list"] ??
+      root.toolMcpList ??
+      root["tool-mcp-list"],
+  );
+  if (toolMcpList) patch.toolMcpList = toolMcpList;
+
+  const toolSkillsList = mapToolSkillsFromUnknown(
+    chatModelNode?.toolSkillsList ??
+      chatModelNode?.["tool-skills-list"] ??
+      root.toolSkillsList ??
+      root["tool-skills-list"],
+  );
+  if (toolSkillsList) patch.toolSkillsList = toolSkillsList;
+
   const apiKey = toNonEmptyString(aiApiNode?.apiKey ?? root.apiKey);
   if (apiKey) patch.apiKey = apiKey;
 
   const runnerAgentName = toNonEmptyString(runnerNode?.agentName ?? root.runnerAgentName);
-  if (runnerAgentName) patch.runnerAgentName = runnerAgentName;
+  if (runnerAgentName) patch.runnerAgentName = sanitizeRuntimeIdentifierInput(runnerAgentName);
 
   const pluginList = toStringListFromUnknown(runnerNode?.pluginNameList ?? root.pluginNameList);
   if (pluginList.length > 0) {
@@ -530,6 +908,8 @@ const mergeCreateFormPatch = (prev: CreateForm, patch: CreateFormPatch): CreateF
   return {
     ...prev,
     ...patch,
+    toolMcpList: patch.toolMcpList ?? prev.toolMcpList,
+    toolSkillsList: patch.toolSkillsList ?? prev.toolSkillsList,
     agents: patch.agents ?? prev.agents,
     agentWorkflows: patch.agentWorkflows ?? prev.agentWorkflows,
   };
@@ -558,6 +938,17 @@ export default function AgentCreatePage() {
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [form, setForm] = useState<CreateForm>(INITIAL_FORM);
+  const [mcpProfiles, setMcpProfiles] = useState<AgentMcpProfileResponseDTO[]>([]);
+  const [skillProfiles, setSkillProfiles] = useState<AgentSkillProfileResponseDTO[]>([]);
+  const [selectedMcpProfileIds, setSelectedMcpProfileIds] = useState<number[]>([]);
+  const [selectedSkillProfileIds, setSelectedSkillProfileIds] = useState<number[]>([]);
+  const [pendingMcpProfileId, setPendingMcpProfileId] = useState("");
+  const [pendingSkillProfileId, setPendingSkillProfileId] = useState("");
+  const [toolProfilesLoaded, setToolProfilesLoaded] = useState(false);
+  const [profileSelectionInitialized, setProfileSelectionInitialized] = useState(false);
+  const [editingAgentId, setEditingAgentId] = useState("");
+  const [loadingEditDetail, setLoadingEditDetail] = useState(false);
+  const isEditMode = Boolean(editingAgentId);
 
   const [assistantSessionId, setAssistantSessionId] = useState("");
   const [assistantInput, setAssistantInput] = useState("");
@@ -583,7 +974,6 @@ export default function AgentCreatePage() {
   };
 
   const validateCreateForm = (): string | null => {
-    if (!form.agentId.trim()) return "请填写 Agent ID";
     if (!form.appName.trim()) return "请填写 appName";
     if (!form.agentName.trim()) return "请填写 Agent 名称";
     if (!form.baseUrl.trim()) return "请填写 baseUrl";
@@ -591,25 +981,80 @@ export default function AgentCreatePage() {
     if (!form.embeddingsPath.trim()) return "请填写 embeddings-path";
     if (!form.model.trim()) return "请填写模型";
     if (form.autoPublish && !form.apiKey.trim()) return "勾选自动发布时必须填写 API Key";
+
+    const hasMissingMcpProfile = selectedMcpProfileIds.some(
+      (id) => !mcpProfiles.some((profile) => profile.id === id),
+    );
+    if (hasMissingMcpProfile) {
+      return "选中的 MCP 配置不存在，请刷新后重选";
+    }
+
+    const hasMissingSkillProfile = selectedSkillProfileIds.some(
+      (id) => !skillProfiles.some((profile) => profile.id === id),
+    );
+    if (hasMissingSkillProfile) {
+      return "选中的 SKILL 配置不存在，请刷新后重选";
+    }
+
     if (!form.agents.length) return "至少需要 1 个 agents 节点";
 
     for (let index = 0; index < form.agents.length; index += 1) {
       const item = form.agents[index];
       if (!item.name.trim()) return `第 ${index + 1} 个 Agent 缺少 name`;
+      if (!isValidRuntimeIdentifier(item.name)) {
+        return `第 ${index + 1} 个 Agent name 非法，仅允许英文字母/数字及 . _ - 空格（且不能为 user）`;
+      }
       if (!item.instruction.trim()) return `第 ${index + 1} 个 Agent 缺少 instruction`;
     }
+
+    const runtimeNameSet = new Set<string>(form.agents.map((item) => item.name.trim()));
 
     for (let index = 0; index < form.agentWorkflows.length; index += 1) {
       const item = form.agentWorkflows[index];
       if (!item.name.trim()) return `第 ${index + 1} 个 Workflow 缺少 name`;
+      if (!isValidRuntimeIdentifier(item.name)) {
+        return `第 ${index + 1} 个 Workflow name 非法，仅允许英文字母/数字及 . _ - 空格（且不能为 user）`;
+      }
+      runtimeNameSet.add(item.name.trim());
       if (!item.type.trim()) return `第 ${index + 1} 个 Workflow 缺少 type`;
-      if (!parseTextList(item.subAgentsText).length) return `第 ${index + 1} 个 Workflow 缺少 subAgents`;
+      const subAgents = parseTextList(item.subAgentsText);
+      if (!subAgents.length) return `第 ${index + 1} 个 Workflow 缺少 subAgents`;
+      for (const subAgent of subAgents) {
+        if (!isValidRuntimeIdentifier(subAgent)) {
+          return `第 ${index + 1} 个 Workflow 的 subAgent "${subAgent}" 非法，仅允许英文字母/数字及 . _ - 空格（且不能为 user）`;
+        }
+      }
       if (item.type === "supervisor" && !item.routerAgent.trim()) {
         return `第 ${index + 1} 个 Workflow 为 supervisor 时必须填写 routerAgent`;
+      }
+      if (item.type === "supervisor" && !isValidRuntimeIdentifier(item.routerAgent)) {
+        return `第 ${index + 1} 个 Workflow 的 routerAgent 非法，仅允许英文字母/数字及 . _ - 空格（且不能为 user）`;
       }
       const maxIterations = Number(item.maxIterations);
       if (!Number.isInteger(maxIterations) || maxIterations <= 0) {
         return `第 ${index + 1} 个 Workflow 的 maxIterations 必须为正整数`;
+      }
+    }
+
+    for (let index = 0; index < form.agentWorkflows.length; index += 1) {
+      const item = form.agentWorkflows[index];
+      const subAgents = parseTextList(item.subAgentsText);
+      for (const subAgent of subAgents) {
+        if (!runtimeNameSet.has(subAgent)) {
+          return `第 ${index + 1} 个 Workflow 的 subAgent "${subAgent}" 未在 agents/workflows 中定义`;
+        }
+      }
+      if (item.type === "supervisor" && item.routerAgent.trim() && !runtimeNameSet.has(item.routerAgent.trim())) {
+        return `第 ${index + 1} 个 Workflow 的 routerAgent "${item.routerAgent.trim()}" 未在 agents/workflows 中定义`;
+      }
+    }
+
+    if (form.runnerAgentName.trim()) {
+      if (!isValidRuntimeIdentifier(form.runnerAgentName)) {
+        return "Runner Agent Name 非法，仅允许英文字母/数字及 . _ - 空格（且不能为 user）";
+      }
+      if (!runtimeNameSet.has(form.runnerAgentName.trim())) {
+        return `Runner Agent Name "${form.runnerAgentName.trim()}" 未在 agents/workflows 中定义`;
       }
     }
 
@@ -654,7 +1099,79 @@ export default function AgentCreatePage() {
     });
   };
 
-  const handleCreateAgent = async () => {
+  const loadToolProfiles = useCallback(async () => {
+    const [mcpResponse, skillResponse] = await Promise.all([
+      agentService.queryMcpProfileList(operator),
+      agentService.querySkillProfileList(operator),
+    ]);
+    if (mcpResponse.code !== SUCCESS_CODE) {
+      throw new Error(mcpResponse.info || "加载 MCP 配置失败");
+    }
+    if (skillResponse.code !== SUCCESS_CODE) {
+      throw new Error(skillResponse.info || "加载 SKILL 配置失败");
+    }
+    setMcpProfiles((mcpResponse.data ?? []).filter((profile) => typeof profile.id === "number"));
+    setSkillProfiles(skillResponse.data ?? []);
+  }, [operator]);
+
+  const addSelectedMcpProfile = () => {
+    const id = Number(pendingMcpProfileId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    setSelectedMcpProfileIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setPendingMcpProfileId("");
+  };
+
+  const removeSelectedMcpProfile = (id: number) => {
+    setSelectedMcpProfileIds((prev) => prev.filter((profileId) => profileId !== id));
+  };
+
+  const addSelectedSkillProfile = () => {
+    const id = Number(pendingSkillProfileId);
+    if (!Number.isInteger(id) || id <= 0) return;
+    setSelectedSkillProfileIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setPendingSkillProfileId("");
+  };
+
+  const removeSelectedSkillProfile = (id: number) => {
+    setSelectedSkillProfileIds((prev) => prev.filter((profileId) => profileId !== id));
+  };
+
+  const loadEditDetail = useCallback(async (agentId: string) => {
+    if (!agentId.trim()) return;
+    setLoadingEditDetail(true);
+    try {
+      const detailResponse = await agentService.queryAgentConfigDetail(agentId);
+      if (detailResponse.code !== SUCCESS_CODE || !detailResponse.data) {
+        throw new Error(detailResponse.info || "加载配置详情失败");
+      }
+
+      const detail = detailResponse.data;
+      const parsedConfig = tryParseProgressiveJson(detail.configJson ?? "");
+      const patchFromConfig = parsedConfig ? buildFormPatchFromUnknown(parsedConfig) : null;
+
+      setForm((prev) => {
+        const base: CreateForm = {
+          ...prev,
+          appName: detail.appName ?? prev.appName,
+          agentName: detail.agentName ?? prev.agentName,
+          agentDesc: detail.agentDesc ?? prev.agentDesc,
+        };
+        if (patchFromConfig) {
+          return mergeCreateFormPatch(base, patchFromConfig);
+        }
+        return base;
+      });
+      setProfileSelectionInitialized(false);
+      showNotice("info", `已加载 Agent 配置：${agentId}`);
+    } catch (error) {
+      console.error(error);
+      showNotice("error", error instanceof Error ? error.message : "加载配置详情失败");
+    } finally {
+      setLoadingEditDetail(false);
+    }
+  }, []);
+
+  const handleSaveAgent = async () => {
     const validationError = validateCreateForm();
     if (validationError) {
       showNotice("error", validationError);
@@ -663,37 +1180,81 @@ export default function AgentCreatePage() {
 
     setCreating(true);
     try {
+      const selectedToolMcpList = selectedMcpProfileIds
+        .map((id) => mcpProfiles.find((profile) => profile.id === id))
+        .filter((profile): profile is AgentMcpProfileResponseDTO => Boolean(profile))
+        .map((profile) => buildToolMcpFromProfile(profile));
+
+      const selectedToolSkillsList = selectedSkillProfileIds
+        .map((id) => skillProfiles.find((profile) => profile.id === id))
+        .filter((profile): profile is AgentSkillProfileResponseDTO => Boolean(profile))
+        .map((profile) => buildToolSkillFromProfile(profile));
+
+      const formForSave: CreateForm = {
+        ...form,
+        toolMcpList: selectedToolMcpList,
+        toolSkillsList: selectedToolSkillsList,
+      };
+
+      setForm((prev) => ({
+        ...prev,
+        toolMcpList: selectedToolMcpList,
+        toolSkillsList: selectedToolSkillsList,
+      }));
+
       const payload = {
-        agentId: form.agentId.trim(),
-        appName: form.appName.trim(),
-        agentName: form.agentName.trim(),
-        agentDesc: form.agentDesc.trim(),
-        configJson: buildConfigJsonFromForm(form),
+        appName: formForSave.appName.trim(),
+        agentName: formForSave.agentName.trim(),
+        agentDesc: formForSave.agentDesc.trim(),
+        configJson: buildConfigJsonFromForm(formForSave, isEditMode ? editingAgentId : undefined),
         operator,
       };
 
-      const createResponse = await agentService.createAgentConfig(payload);
-      if (createResponse.code !== SUCCESS_CODE || !createResponse.data) {
-        throw new Error(createResponse.info || "创建 Agent 失败");
+      if (isEditMode && !editingAgentId.trim()) {
+        throw new Error("agentId missing in edit mode");
       }
+
+      const saveResponse = isEditMode
+        ? await agentService.updateAgentConfig({
+            ...payload,
+            agentId: editingAgentId,
+          })
+        : await agentService.createAgentConfig(payload);
+
+      if (saveResponse.code !== SUCCESS_CODE || !saveResponse.data) {
+        throw new Error(saveResponse.info || (isEditMode ? "更新 Agent 失败" : "创建 Agent 失败"));
+      }
+      const savedAgentId = saveResponse.data.agentId;
 
       if (form.autoPublish) {
         const publishResponse = await agentService.publishAgentConfig({
-          agentId: payload.agentId,
+          agentId: savedAgentId,
           operator: payload.operator,
         });
         if (publishResponse.code !== SUCCESS_CODE) {
-          throw new Error(publishResponse.info || "创建成功，但自动发布失败，请稍后手动发布");
+          throw new Error(
+            publishResponse.info ||
+              (isEditMode ? "更新成功，但自动发布失败，请稍后手动发布" : "创建成功，但自动发布失败，请稍后手动发布"),
+          );
         }
       }
 
-      showNotice("success", form.autoPublish ? "创建并发布成功，正在返回 Agent 列表..." : "创建成功，正在返回 Agent 列表...");
+      showNotice(
+        "success",
+        form.autoPublish
+          ? isEditMode
+            ? "更新并发布成功，正在返回 Agent 列表..."
+            : "创建并发布成功，正在返回 Agent 列表..."
+          : isEditMode
+            ? "更新成功，正在返回 Agent 列表..."
+            : "创建成功，正在返回 Agent 列表...",
+      );
       setTimeout(() => {
         router.push("/");
       }, 700);
     } catch (error) {
       console.error(error);
-      showNotice("error", error instanceof Error ? error.message : "创建失败");
+      showNotice("error", error instanceof Error ? error.message : isEditMode ? "更新失败" : "创建失败");
     } finally {
       setCreating(false);
     }
@@ -835,6 +1396,96 @@ export default function AgentCreatePage() {
   }, [router, session.isLoggedIn, session.username]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const targetAgentId = new URLSearchParams(window.location.search).get("agentId")?.trim() ?? "";
+    setEditingAgentId(targetAgentId);
+    setProfileSelectionInitialized(false);
+  }, []);
+
+  useEffect(() => {
+    if (!editingAgentId.trim()) return;
+    if (session.isLoggedIn !== "true" || !session.username) return;
+    void loadEditDetail(editingAgentId);
+  }, [editingAgentId, loadEditDetail, session.isLoggedIn, session.username]);
+
+  useEffect(() => {
+    if (session.isLoggedIn !== "true" || !session.username) return;
+    let active = true;
+    void (async () => {
+      try {
+        await loadToolProfiles();
+      } catch (error) {
+        console.error(error);
+        setNotice({
+          type: "error",
+          text: error instanceof Error ? error.message : "加载 MCP/SKILL 配置失败",
+        });
+      } finally {
+        if (active) {
+          setToolProfilesLoaded(true);
+        }
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [loadToolProfiles, session.isLoggedIn, session.username]);
+
+  useEffect(() => {
+    if (!toolProfilesLoaded || profileSelectionInitialized) return;
+    if (isEditMode && loadingEditDetail) return;
+
+    const matchedMcpIds = form.toolMcpList
+      .map((item) => {
+        const signature = mcpProfileSignature(item);
+        const matched = mcpProfiles.find((profile) => mcpSignatureFromProfile(profile) === signature);
+        return matched?.id;
+      })
+      .filter((id): id is number => typeof id === "number");
+
+    const matchedSkillIds = form.toolSkillsList
+      .map((item) => {
+        const itemPath = normalizeSkillPathLoose(item.path || `${SKILL_OSS_PREFIX}${item.rootFolder || ""}`);
+        const matched = skillProfiles.find((profile) => normalizeSkillPathLoose(profile.ossPath || "") === itemPath);
+        return matched?.id;
+      })
+      .filter((id): id is number => typeof id === "number");
+
+    setSelectedMcpProfileIds(Array.from(new Set(matchedMcpIds)));
+    setSelectedSkillProfileIds(Array.from(new Set(matchedSkillIds)));
+    setProfileSelectionInitialized(true);
+  }, [
+    form.toolMcpList,
+    form.toolSkillsList,
+    isEditMode,
+    loadingEditDetail,
+    mcpProfiles,
+    profileSelectionInitialized,
+    skillProfiles,
+    toolProfilesLoaded,
+  ]);
+
+  useEffect(() => {
+    if (!profileSelectionInitialized) return;
+
+    const selectedMcp = selectedMcpProfileIds
+      .map((id) => mcpProfiles.find((profile) => profile.id === id))
+      .filter((item): item is AgentMcpProfileResponseDTO => Boolean(item))
+      .map((profile) => buildToolMcpFromProfile(profile));
+
+    const selectedSkills = selectedSkillProfileIds
+      .map((id) => skillProfiles.find((profile) => profile.id === id))
+      .filter((item): item is AgentSkillProfileResponseDTO => Boolean(item))
+      .map((profile) => buildToolSkillFromProfile(profile));
+
+    setForm((prev) => ({
+      ...prev,
+      toolMcpList: selectedMcp,
+      toolSkillsList: selectedSkills,
+    }));
+  }, [mcpProfiles, profileSelectionInitialized, selectedMcpProfileIds, selectedSkillProfileIds, skillProfiles]);
+
+  useEffect(() => {
     const viewport = assistantViewportRef.current;
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
@@ -850,7 +1501,7 @@ export default function AgentCreatePage() {
     <div className="min-h-screen bg-gradient-to-br from-slate-100 via-zinc-100 to-slate-200 px-4 py-6 text-zinc-900 sm:px-6 sm:py-10">
       <div className="mx-auto w-full max-w-[1500px]">
         <div className="mb-4 flex items-center justify-between">
-          <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">新建 Agent</h1>
+          <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">{isEditMode ? "更新 Agent 配置" : "新建 Agent"}</h1>
           <button
             type="button"
             onClick={() => router.push("/")}
@@ -879,15 +1530,15 @@ export default function AgentCreatePage() {
           <section className="rounded-3xl border border-zinc-200 bg-white/90 p-6 shadow-sm backdrop-blur">
             <div className="space-y-4">
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <div>
-                  <label className="mb-1 block text-sm text-zinc-600">Agent ID</label>
-                  <input
-                    className="w-full rounded-xl border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                    placeholder="例如：100901"
-                    value={form.agentId}
-                    onChange={(event) => setForm((prev) => ({ ...prev, agentId: event.target.value }))}
-                  />
-                </div>
+                {isEditMode ? (
+                  <div className="md:col-span-2">
+                    <label className="mb-1 block text-sm text-zinc-600">Agent ID（只读）</label>
+                    <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
+                      {editingAgentId}
+                    </div>
+                  </div>
+                ) : null}
+
 
                 <div>
                   <label className="mb-1 block text-sm text-zinc-600">应用名 appName</label>
@@ -972,9 +1623,14 @@ export default function AgentCreatePage() {
                   <label className="mb-1 block text-sm text-zinc-600">Runner Agent Name（可选）</label>
                   <input
                     className="w-full rounded-xl border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                    placeholder="默认取首个 workflow 名称"
+                    placeholder="仅英文/数字/._- 空格（默认取首个 workflow 名称）"
                     value={form.runnerAgentName}
-                    onChange={(event) => setForm((prev) => ({ ...prev, runnerAgentName: event.target.value }))}
+                    onChange={(event) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        runnerAgentName: sanitizeRuntimeIdentifierInput(event.target.value),
+                      }))
+                    }
                   />
                 </div>
 
@@ -987,6 +1643,130 @@ export default function AgentCreatePage() {
                     onChange={(event) => setForm((prev) => ({ ...prev, pluginNameListText: event.target.value }))}
                   />
                 </div>
+              </div>
+
+              <div className="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-base font-semibold text-zinc-800">chatModel.toolMcpList</h2>
+                </div>
+
+                <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                  <select
+                    className="rounded-xl border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
+                    value={pendingMcpProfileId}
+                    onChange={(event) => setPendingMcpProfileId(event.target.value)}
+                  >
+                    <option value="">请选择已保存的 MCP 配置</option>
+                    {mcpProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.name} ({normalizeMcpTransportType(profile.type)})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={addSelectedMcpProfile}
+                    className="rounded-xl border border-blue-300 bg-blue-50 px-4 py-2 text-sm text-blue-700 hover:bg-blue-100"
+                  >
+                    添加
+                  </button>
+                </div>
+
+                {selectedMcpProfileIds.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-4 text-sm text-zinc-500">
+                    未选择 MCP。请先在首页 MCP 标签中维护配置，然后在这里下拉选择。
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {selectedMcpProfileIds.map((profileId) => {
+                      const profile = mcpProfiles.find((item) => item.id === profileId);
+                      if (!profile) return null;
+                      return (
+                        <div key={profileId} className="rounded-xl border border-zinc-200 bg-white p-3">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-semibold text-zinc-800">{profile.name}</div>
+                              <div className="mt-1 text-xs text-zinc-500">
+                                {normalizeMcpTransportType(profile.type)} · {profile.name}
+                              </div>
+                              <div className="mt-1 truncate text-xs text-zinc-500">
+                                {profile.baseUri}
+                                {profile.sseEndpoint ? ` / ${profile.sseEndpoint}` : ""}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => removeSelectedMcpProfile(profileId)}
+                              className="inline-flex items-center gap-1 rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+                            >
+                              <Trash2 size={12} />
+                              移除
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-base font-semibold text-zinc-800">chatModel.toolSkillsList</h2>
+                </div>
+
+                <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
+                  <select
+                    className="rounded-xl border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
+                    value={pendingSkillProfileId}
+                    onChange={(event) => setPendingSkillProfileId(event.target.value)}
+                  >
+                    <option value="">请选择已保存的 SKILL 配置</option>
+                    {skillProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.skillName} ({profile.ossPath})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={addSelectedSkillProfile}
+                    className="rounded-xl border border-blue-300 bg-blue-50 px-4 py-2 text-sm text-blue-700 hover:bg-blue-100"
+                  >
+                    添加
+                  </button>
+                </div>
+
+                {selectedSkillProfileIds.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-4 text-sm text-zinc-500">
+                    未选择 SKILL。请先在首页 SKILLs 标签中维护配置，然后在这里下拉选择。
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {selectedSkillProfileIds.map((profileId) => {
+                      const profile = skillProfiles.find((item) => item.id === profileId);
+                      if (!profile) return null;
+                      return (
+                        <div key={profileId} className="rounded-xl border border-zinc-200 bg-white p-3">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-semibold text-zinc-800">{profile.skillName}</div>
+                              <div className="mt-1 truncate text-xs text-zinc-500">{profile.ossPath}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => removeSelectedSkillProfile(profileId)}
+                              className="inline-flex items-center gap-1 rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+                            >
+                              <Trash2 size={12} />
+                              移除
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               <div className="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4">
@@ -1020,9 +1800,11 @@ export default function AgentCreatePage() {
                       <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                         <input
                           className="rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                          placeholder="name（必填）"
+                          placeholder="name（必填，仅英文/数字/._- 空格）"
                           value={item.name}
-                          onChange={(event) => updateAgentItem(index, { name: event.target.value })}
+                          onChange={(event) =>
+                            updateAgentItem(index, { name: sanitizeRuntimeIdentifierInput(event.target.value) })
+                          }
                         />
                         <input
                           className="rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
@@ -1091,9 +1873,11 @@ export default function AgentCreatePage() {
                         </select>
                         <input
                           className="rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                          placeholder="name（必填）"
+                          placeholder="name（必填，仅英文/数字/._- 空格）"
                           value={item.name}
-                          onChange={(event) => updateWorkflowItem(index, { name: event.target.value })}
+                          onChange={(event) =>
+                            updateWorkflowItem(index, { name: sanitizeRuntimeIdentifierInput(event.target.value) })
+                          }
                         />
                         <input
                           className="rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
@@ -1103,9 +1887,11 @@ export default function AgentCreatePage() {
                         />
                         <input
                           className="rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                          placeholder="routerAgent（supervisor 时必填）"
+                          placeholder="routerAgent（supervisor 时必填，仅英文/数字/._- 空格）"
                           value={item.routerAgent}
-                          onChange={(event) => updateWorkflowItem(index, { routerAgent: event.target.value })}
+                          onChange={(event) =>
+                            updateWorkflowItem(index, { routerAgent: sanitizeRuntimeIdentifierInput(event.target.value) })
+                          }
                         />
                         <input
                           className="md:col-span-2 rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
@@ -1115,9 +1901,13 @@ export default function AgentCreatePage() {
                         />
                         <textarea
                           className="md:col-span-2 h-20 rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                          placeholder="subAgents（逗号或换行分隔）"
+                          placeholder="subAgents（逗号或换行分隔，仅英文/数字/._- 空格）"
                           value={item.subAgentsText}
-                          onChange={(event) => updateWorkflowItem(index, { subAgentsText: event.target.value })}
+                          onChange={(event) =>
+                            updateWorkflowItem(index, {
+                              subAgentsText: sanitizeRuntimeIdentifierListInput(event.target.value),
+                            })
+                          }
                         />
                       </div>
                     </div>
@@ -1135,17 +1925,22 @@ export default function AgentCreatePage() {
 
               <button
                 type="button"
-                onClick={handleCreateAgent}
-                disabled={creating}
+                onClick={handleSaveAgent}
+                disabled={creating || loadingEditDetail}
                 className="mt-2 inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-blue-600 to-blue-500 px-4 py-3 text-base font-semibold text-white shadow transition hover:from-blue-700 hover:to-blue-600 disabled:opacity-60"
               >
                 {creating ? (
                   <>
                     <Loader2 size={16} className="mr-2 animate-spin" />
-                    创建中...
+                    {isEditMode ? "更新中..." : "创建中..."}
+                  </>
+                ) : loadingEditDetail ? (
+                  <>
+                    <Loader2 size={16} className="mr-2 animate-spin" />
+                    加载配置中...
                   </>
                 ) : (
-                  "确认创建"
+                  isEditMode ? "确认更新" : "确认创建"
                 )}
               </button>
             </div>

@@ -1,16 +1,26 @@
 ﻿"use client";
 
+/**
+ * 首页（我的 Agent）：展示我的 Agent、订阅与广场入口。
+ */
+
+
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Bot, Ellipsis, Heart, Loader2, LogOut, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
+import { Bot, Circle, Ellipsis, Heart, Loader2, LogOut, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
 import { agentService } from "@/api/agent";
 import { cookieUtils } from "@/utils/cookie";
-import type { AgentConfigSummaryResponseDTO } from "@/types/api";
+import type {
+  AgentConfigSummaryResponseDTO,
+  AgentMcpProfileResponseDTO,
+  AgentSkillProfileResponseDTO,
+} from "@/types/api";
 
 const SUCCESS_CODE = "0000";
 const STATUS_PUBLISHED = "PUBLISHED";
 const PLAZA_ON = "ON";
 const SOURCE_OFFICIAL = "OFFICIAL";
+const SYSTEM_USER_ID = "system";
 
 type Notice = {
   type: "success" | "error" | "info";
@@ -18,6 +28,49 @@ type Notice = {
 };
 
 type ViewTab = "my" | "subscribed" | "plaza";
+type MyAgentTab = "created" | "mcp" | "skills";
+type McpProfileTransportType = "sse" | "streamableHttp";
+
+type McpProfileForm = {
+  id?: number;
+  configJson: string;
+};
+
+type McpConnectionState = "success" | "failed";
+
+type McpJsonServerConfig = {
+  id?: number;
+  configJson: string;
+  type: McpProfileTransportType;
+  name: string;
+  description: string;
+  baseUri: string;
+  endpoint: string;
+  requestTimeout: number;
+  authType?: string;
+  authToken?: string;
+  authKeyName?: string;
+  headersJson?: string;
+  queryJson?: string;
+};
+
+const MCP_JSON_TEMPLATE = `{
+  "mcpServers": {
+    "web-search-mcp-server": {
+      "type": "streamableHttp",
+      "description": "根据用户提问，搜索实时网页信息",
+      "url": "https://qianfan.baidubce.com/v2/tools/web-search/mcp",
+      "headers": {
+        "Authorization": "Bearer xxxxx"
+      }
+    }
+  }
+}`;
+
+const EMPTY_MCP_PROFILE_FORM: McpProfileForm = {
+  configJson: MCP_JSON_TEMPLATE,
+};
+
 
 const formatIdLabel = (agentId: string) => {
   if (!agentId) return "-";
@@ -32,8 +85,198 @@ const formatStatusText = (status?: string) => {
   return status || "未知";
 };
 
+const formatMcpTypeText = (type?: string) => {
+  if (type === "streamableHttp") return "streamableHttp";
+  return "sse";
+};
+
+const isObjectRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+};
+
+const pickStringRecord = (value: unknown): Record<string, string> => {
+  if (!isObjectRecord(value)) return {};
+  const record: Record<string, string> = {};
+  Object.entries(value).forEach(([key, item]) => {
+    if (typeof item === "string" && key.trim()) {
+      record[key.trim()] = item;
+    } else if (typeof item === "number" || typeof item === "boolean") {
+      record[key.trim()] = String(item);
+    }
+  });
+  return record;
+};
+
+const normalizeMcpType = (value: unknown): McpProfileTransportType => {
+  if (typeof value === "string" && value.trim().toLowerCase() === "streamablehttp") {
+    return "streamableHttp";
+  }
+  return "sse";
+};
+
+const normalizeEndpointPath = (rawPath: string, type: McpProfileTransportType): string => {
+  const fallback = type === "streamableHttp" ? "/mcp" : "/sse";
+  const path = rawPath.trim();
+  if (!path) return fallback;
+  if (path.startsWith("/")) return path;
+  return `/${path}`;
+};
+
+const parseMcpJsonConfig = (jsonText: string, profileId?: number): McpJsonServerConfig => {
+  if (!jsonText.trim()) {
+    throw new Error("请先输入 MCP JSON 配置");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error) {
+    throw new Error(error instanceof Error ? `JSON 解析失败：${error.message}` : "JSON 解析失败");
+  }
+
+  if (!isObjectRecord(parsed) || !isObjectRecord(parsed.mcpServers)) {
+    throw new Error("JSON 蹇呴』鍖呭惈 mcpServers 瀵硅薄");
+  }
+
+  const serverEntries = Object.entries(parsed.mcpServers).filter(
+    ([name, config]) => name.trim().length > 0 && isObjectRecord(config),
+  );
+  if (serverEntries.length !== 1) {
+    throw new Error("当前每次仅支持配置 1 个 MCP Server，请在 mcpServers 中只保留一个对象");
+  }
+
+  const [serverName, rawServerConfig] = serverEntries[0];
+  const rawConfig = rawServerConfig as Record<string, unknown>;
+  const type = normalizeMcpType(rawConfig.type);
+  const description = typeof rawConfig.description === "string" ? rawConfig.description.trim() : "";
+  const rawUrl = typeof rawConfig.url === "string" ? rawConfig.url.trim() : "";
+  if (!rawUrl) {
+    throw new Error("mcpServers.<name>.url 不能为空");
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch (error) {
+    throw new Error(error instanceof Error ? `url 格式非法: ${error.message}` : "url 格式非法");
+  }
+  if (!/^https?:$/i.test(parsedUrl.protocol)) {
+    throw new Error("url 协议仅支持 http:// 或 https://");
+  }
+
+  const baseUri = parsedUrl.origin;
+  const pathFromUrl = parsedUrl.pathname || "";
+  const endpoint = normalizeEndpointPath(pathFromUrl, type);
+
+  const headers = pickStringRecord(rawConfig.headers);
+  const query = {
+    ...pickStringRecord(rawConfig.query),
+    ...pickStringRecord(rawConfig.queryParams),
+  };
+
+  const auth = isObjectRecord(rawConfig.auth) ? rawConfig.auth : null;
+  const authTypeRaw = typeof auth?.type === "string" ? auth.type.trim().toLowerCase().replace("-", "") : "";
+  const authType = authTypeRaw === "bearer" || authTypeRaw === "apikey" || authTypeRaw === "none"
+    ? (authTypeRaw === "apikey" ? "apiKey" : authTypeRaw)
+    : undefined;
+  const authToken = typeof auth?.token === "string" ? auth.token : undefined;
+  const authKeyName = typeof auth?.keyName === "string" ? auth.keyName : undefined;
+
+  const timeoutRaw = Number(rawConfig.requestTimeout);
+  const requestTimeout = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.floor(timeoutRaw) : 3000;
+
+  const mergedQuery: Record<string, string> = { ...query };
+  parsedUrl.searchParams.forEach((value, key) => {
+    if (!mergedQuery[key]) {
+      mergedQuery[key] = value;
+    }
+  });
+
+  return {
+    id: profileId,
+    configJson: JSON.stringify(parsed, null, 2),
+    type,
+    name: serverName.trim(),
+    description,
+    baseUri,
+    endpoint,
+    requestTimeout,
+    authType,
+    authToken,
+    authKeyName,
+    headersJson: Object.keys(headers).length ? JSON.stringify(headers) : "",
+    queryJson: Object.keys(mergedQuery).length ? JSON.stringify(mergedQuery) : "",
+  };
+};
+
+const buildMcpJsonFromProfile = (profile: AgentMcpProfileResponseDTO): string => {
+  if (profile.configJson && profile.configJson.trim()) {
+    try {
+      return JSON.stringify(JSON.parse(profile.configJson), null, 2);
+    } catch {
+      // fallback to reconstructed json
+    }
+  }
+  const endpoint = profile.sseEndpoint?.trim() || (profile.type === "streamableHttp" ? "/mcp" : "/sse");
+  const baseUri = profile.baseUri?.trim() || "";
+  const url = `${baseUri}${endpoint}`;
+  const headers = (() => {
+    if (!profile.headersJson) return {};
+    try {
+      const parsed = JSON.parse(profile.headersJson);
+      return pickStringRecord(parsed);
+    } catch {
+      return {};
+    }
+  })();
+
+  const query = (() => {
+    if (!profile.queryJson) return {};
+    try {
+      const parsed = JSON.parse(profile.queryJson);
+      return pickStringRecord(parsed);
+    } catch {
+      return {};
+    }
+  })();
+
+  const payload: Record<string, unknown> = {
+    type: profile.type === "streamableHttp" ? "streamableHttp" : "sse",
+    description: profile.description || "",
+    url,
+  };
+  if (Object.keys(headers).length) payload.headers = headers;
+  if (Object.keys(query).length) payload.query = query;
+  if (profile.requestTimeout && profile.requestTimeout > 0) payload.requestTimeout = profile.requestTimeout;
+  if (profile.authType && profile.authType !== "none") {
+    payload.auth = {
+      type: profile.authType,
+      token: profile.authToken || "",
+      keyName: profile.authKeyName || "",
+    };
+  }
+
+  return JSON.stringify(
+    {
+      mcpServers: {
+        [profile.name || "mcp-server"]: payload,
+      },
+    },
+    null,
+    2,
+  );
+};
+
 const canOpenChat = (agent: AgentConfigSummaryResponseDTO) => {
   return agent.status === STATUS_PUBLISHED || (agent.publishedVersion ?? 0) > 0;
+};
+
+const isSystemOwner = (ownerUserId?: string) => {
+  return (ownerUserId || "").trim().toLowerCase() === SYSTEM_USER_ID;
+};
+
+const canOperateMcpProfile = (profile: AgentMcpProfileResponseDTO) => {
+  return typeof profile.id === "number" && !isSystemOwner(profile.userId);
 };
 
 export default function MyAgentPage() {
@@ -44,9 +287,17 @@ export default function MyAgentPage() {
   const [busyAgentId, setBusyAgentId] = useState("");
   const [openMenuAgentId, setOpenMenuAgentId] = useState("");
   const [activeTab, setActiveTab] = useState<ViewTab>("my");
+  const [activeMyTab, setActiveMyTab] = useState<MyAgentTab>("created");
   const [myAgents, setMyAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
   const [plazaAgents, setPlazaAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
   const [subscribedAgents, setSubscribedAgents] = useState<AgentConfigSummaryResponseDTO[]>([]);
+  const [mcpProfiles, setMcpProfiles] = useState<AgentMcpProfileResponseDTO[]>([]);
+  const [skillProfiles, setSkillProfiles] = useState<AgentSkillProfileResponseDTO[]>([]);
+  const [mcpProfileForm, setMcpProfileForm] = useState<McpProfileForm>(EMPTY_MCP_PROFILE_FORM);
+  const [profileSubmitting, setProfileSubmitting] = useState(false);
+  const [mcpTesting, setMcpTesting] = useState(false);
+  const [mcpConnectionStateById, setMcpConnectionStateById] = useState<Record<number, McpConnectionState>>({});
+  const [testingMcpProfileId, setTestingMcpProfileId] = useState<number | null>(null);
 
   const avatarPalette = useMemo(
     () => [
@@ -68,7 +319,7 @@ export default function MyAgentPage() {
       error: "失败",
       info: "提示",
     };
-    const title = `EasyAgent平台 - ${titleMap[type]}`;
+    const title = `EasyAgent 平台 - ${titleMap[type]}`;
 
     // 使用浏览器原生通知，2 秒后自动关闭；不再在页面中显示提示条。
     const pushNotification = () => {
@@ -99,28 +350,56 @@ export default function MyAgentPage() {
     async (currentUserId: string) => {
       setLoading(true);
       try {
-        const [myResponse, plazaResponse, subscribeResponse] = await Promise.all([
+        const [myResponse, plazaResponse, subscribeResponse, mcpProfileResponse, skillProfileResponse] = await Promise.all([
           agentService.queryMyAgentConfigList(currentUserId),
           agentService.queryAgentPlazaList(),
           agentService.queryMySubscribedAgentConfigList(currentUserId),
+          agentService.queryMcpProfileList(currentUserId),
+          agentService.querySkillProfileList(currentUserId),
         ]);
+        const errors: string[] = [];
 
-        if (myResponse.code !== SUCCESS_CODE) {
-          throw new Error(myResponse.info || "加载我的Agent失败");
-        }
-        if (plazaResponse.code !== SUCCESS_CODE) {
-          throw new Error(plazaResponse.info || "加载Agent广场失败");
-        }
-        if (subscribeResponse.code !== SUCCESS_CODE) {
-          throw new Error(subscribeResponse.info || "加载我的订阅失败");
+        if (myResponse.code === SUCCESS_CODE) {
+          setMyAgents(myResponse.data ?? []);
+        } else {
+          setMyAgents([]);
+          errors.push(myResponse.info || "加载我的 Agent 失败");
         }
 
-        setMyAgents(myResponse.data ?? []);
-        setPlazaAgents(plazaResponse.data ?? []);
-        setSubscribedAgents(subscribeResponse.data ?? []);
+        if (plazaResponse.code === SUCCESS_CODE) {
+          setPlazaAgents(plazaResponse.data ?? []);
+        } else {
+          setPlazaAgents([]);
+          errors.push(plazaResponse.info || "加载 Agent 广场失败");
+        }
+
+        if (subscribeResponse.code === SUCCESS_CODE) {
+          setSubscribedAgents(subscribeResponse.data ?? []);
+        } else {
+          setSubscribedAgents([]);
+          errors.push(subscribeResponse.info || "加载我的订阅失败");
+        }
+
+        if (mcpProfileResponse.code === SUCCESS_CODE) {
+          setMcpProfiles(mcpProfileResponse.data ?? []);
+        } else {
+          setMcpProfiles([]);
+          errors.push(mcpProfileResponse.info || "加载 MCP 配置失败");
+        }
+
+        if (skillProfileResponse.code === SUCCESS_CODE) {
+          setSkillProfiles(skillProfileResponse.data ?? []);
+        } else {
+          setSkillProfiles([]);
+          errors.push(skillProfileResponse.info || "加载 SKILL 配置失败");
+        }
+
+        if (errors.length > 0) {
+          showNotice("error", errors[0]);
+        }
       } catch (error) {
         console.error(error);
-        showNotice("error", error instanceof Error ? error.message : "加载Agent列表失败");
+        showNotice("error", error instanceof Error ? error.message : "加载 Agent 列表失败");
       } finally {
         setLoading(false);
       }
@@ -148,7 +427,7 @@ export default function MyAgentPage() {
 
   const handleOpenChat = (agent: AgentConfigSummaryResponseDTO) => {
     if (!canOpenChat(agent)) {
-      showNotice("info", "该Agent尚未发布运行，暂不可进入会话");
+      showNotice("info", "该 Agent 尚未发布运行，暂不可进入会话");
       return;
     }
     router.push(`/chat?agentId=${encodeURIComponent(agent.agentId)}`);
@@ -182,127 +461,12 @@ export default function MyAgentPage() {
     });
   };
 
-  const handleQuickUpdateAgent = async (agent: AgentConfigSummaryResponseDTO) => {
-    await withBusyAgent(agent.agentId, async () => {
-      try {
-        const detailResponse = await agentService.queryAgentConfigDetail(agent.agentId);
-        if (detailResponse.code !== SUCCESS_CODE || !detailResponse.data) {
-          throw new Error(detailResponse.info || "查询Agent详情失败");
-        }
-
-        const detail = detailResponse.data;
-        const nextName = window.prompt("请输入新的Agent名称", detail.agentName || agent.agentName || "");
-        if (nextName === null) return;
-
-        const nextDesc = window.prompt("请输入新的Agent描述", detail.agentDesc || agent.agentDesc || "");
-        if (nextDesc === null) return;
-
-        const agentName = nextName.trim();
-        if (!agentName) {
-          showNotice("error", "Agent名称不能为空");
-          return;
-        }
-
-        const rawConfigJson = detail.configJson?.trim() || "";
-        if (!rawConfigJson) {
-          throw new Error("当前Agent缺少configJson，无法更新");
-        }
-
-        const normalizedConfigJson = JSON.stringify(JSON.parse(rawConfigJson));
-        const response = await agentService.updateAgentConfig({
-          agentId: detail.agentId,
-          appName: detail.appName,
-          agentName,
-          agentDesc: nextDesc.trim(),
-          configJson: normalizedConfigJson,
-          operator: userId || "admin",
-        });
-
-        if (response.code !== SUCCESS_CODE || !response.data) {
-          throw new Error(response.info || "更新失败");
-        }
-
-        showNotice("success", `已更新：${agentName}`);
-        await refreshAll();
-      } catch (error) {
-        console.error(error);
-        showNotice("error", error instanceof Error ? error.message : "更新失败");
-      }
-    });
-  };
-
-  const handlePublishAgent = async (agent: AgentConfigSummaryResponseDTO) => {
-    await withBusyAgent(agent.agentId, async () => {
-      try {
-        const response = await agentService.publishAgentConfig({
-          agentId: agent.agentId,
-          operator: userId || "admin",
-        });
-        if (response.code !== SUCCESS_CODE || !response.data) {
-          throw new Error(response.info || "发布失败");
-        }
-
-        showNotice("success", `已发布运行：${agent.agentName}`);
-        await refreshAll();
-      } catch (error) {
-        console.error(error);
-        showNotice("error", error instanceof Error ? error.message : "发布失败");
-      }
-    });
-  };
-
-  const handleOfflineAgent = async (agent: AgentConfigSummaryResponseDTO) => {
-    await withBusyAgent(agent.agentId, async () => {
-      try {
-        const response = await agentService.offlineAgentConfig({
-          agentId: agent.agentId,
-          operator: userId || "admin",
-        });
-        if (response.code !== SUCCESS_CODE || !response.data) {
-          throw new Error(response.info || "下线失败");
-        }
-
-        showNotice("success", `已下线：${agent.agentName}`);
-        await refreshAll();
-      } catch (error) {
-        console.error(error);
-        showNotice("error", error instanceof Error ? error.message : "下线失败");
-      }
-    });
-  };
-
-  const handleRollbackAgent = async (agent: AgentConfigSummaryResponseDTO) => {
-    const raw = window.prompt("请输入回滚版本号（正整数）", "1");
-    if (!raw) return;
-
-    const targetVersion = Number(raw);
-    if (!Number.isInteger(targetVersion) || targetVersion <= 0) {
-      showNotice("error", "版本号必须为正整数");
-      return;
-    }
-
-    await withBusyAgent(agent.agentId, async () => {
-      try {
-        const response = await agentService.rollbackAgentConfig({
-          agentId: agent.agentId,
-          targetVersion,
-          operator: userId || "admin",
-        });
-        if (response.code !== SUCCESS_CODE || !response.data) {
-          throw new Error(response.info || "回滚失败");
-        }
-
-        showNotice("success", `已回滚到版本 ${targetVersion}：${agent.agentName}`);
-        await refreshAll();
-      } catch (error) {
-        console.error(error);
-        showNotice("error", error instanceof Error ? error.message : "回滚失败");
-      }
-    });
+  const handleGoUpdateConfig = (agent: AgentConfigSummaryResponseDTO) => {
+    router.push(`/agent-create?agentId=${encodeURIComponent(agent.agentId)}`);
   };
 
   const handleDeleteAgent = async (agent: AgentConfigSummaryResponseDTO) => {
-    if (!window.confirm(`确认删除 Agent「${agent.agentName}」?`)) {
+    if (!window.confirm(`确认删除 Agent「${agent.agentName}」吗？`)) {
       return;
     }
 
@@ -316,12 +480,12 @@ export default function MyAgentPage() {
           throw new Error(response.info || "删除失败");
         }
 
-        // 删除成功后先本地移除，避免用户看到“已删除”但卡片仍停留在页面上。
+        // 删除成功后先本地移除，避免用户看到“已删除”但卡片仍停留在页面中。
         setMyAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
         setPlazaAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
         setSubscribedAgents((prev) => prev.filter((item) => item.agentId !== agent.agentId));
         setOpenMenuAgentId((prev) => (prev === agent.agentId ? "" : prev));
-        showNotice("success", `已删除Agent：${agent.agentName}`);
+        showNotice("success", `已删除 Agent：${agent.agentName}`);
       } catch (error) {
         console.error(error);
         showNotice("error", error instanceof Error ? error.message : "删除失败");
@@ -367,6 +531,230 @@ export default function MyAgentPage() {
         showNotice("error", error instanceof Error ? error.message : "从广场下架失败");
       }
     });
+  };
+
+  const handleSaveMcpProfile = async () => {
+    if (!userId) return;
+
+    setProfileSubmitting(true);
+    try {
+      const parsed = parseMcpJsonConfig(mcpProfileForm.configJson, mcpProfileForm.id);
+      const payload = {
+        id: parsed.id,
+        userId,
+        configJson: parsed.configJson,
+        description: parsed.description,
+        type: parsed.type,
+        name: parsed.name,
+        baseUri: parsed.baseUri,
+        sseEndpoint: parsed.endpoint,
+        requestTimeout: parsed.requestTimeout,
+        authType: parsed.authType,
+        authToken: parsed.authToken,
+        authKeyName: parsed.authKeyName,
+        headersJson: parsed.headersJson,
+        queryJson: parsed.queryJson,
+      };
+
+      const response = parsed.id
+        ? await agentService.updateMcpProfile(payload)
+        : await agentService.createMcpProfile(payload);
+
+      if (response.code !== SUCCESS_CODE) {
+        throw new Error(response.info || "保存 MCP 配置失败");
+      }
+
+      setMcpProfileForm(EMPTY_MCP_PROFILE_FORM);
+      await refreshAll();
+      showNotice("success", parsed.id ? "MCP 配置已更新" : "MCP 配置已创建");
+    } catch (error) {
+      console.error(error);
+      showNotice("error", error instanceof Error ? error.message : "保存 MCP 配置失败");
+    } finally {
+      setProfileSubmitting(false);
+    }
+  };
+
+  const buildMcpTestPayloadFromProfile = (profile: AgentMcpProfileResponseDTO): McpJsonServerConfig => ({
+    id: profile.id,
+    configJson: buildMcpJsonFromProfile(profile),
+    description: profile.description || "",
+    type: profile.type === "streamableHttp" ? "streamableHttp" : "sse",
+    name: profile.name || "",
+    baseUri: profile.baseUri || "",
+    endpoint: profile.sseEndpoint || "",
+    requestTimeout: profile.requestTimeout ?? 3000,
+    authType: profile.authType || undefined,
+    authToken: profile.authToken || undefined,
+    authKeyName: profile.authKeyName || undefined,
+    headersJson: profile.headersJson || undefined,
+    queryJson: profile.queryJson || undefined,
+  });
+
+  const runMcpConnectionTest = async (
+    requestPayload: McpJsonServerConfig,
+    options?: { silent?: boolean },
+  ): Promise<boolean> => {
+    const targetProfileId = requestPayload.id;
+    if (typeof targetProfileId === "number") {
+      setTestingMcpProfileId(targetProfileId);
+    }
+
+    try {
+      const response = await agentService.testMcpProfileConnection({
+        id: requestPayload.id,
+        configJson: requestPayload.configJson,
+        description: requestPayload.description,
+        type: requestPayload.type,
+        name: requestPayload.name,
+        baseUri: requestPayload.baseUri,
+        sseEndpoint: requestPayload.endpoint,
+        requestTimeout: requestPayload.requestTimeout,
+        authType: requestPayload.authType,
+        authToken: requestPayload.authToken,
+        authKeyName: requestPayload.authKeyName,
+        headersJson: requestPayload.headersJson,
+        queryJson: requestPayload.queryJson,
+        userId,
+      });
+      if (response.code !== SUCCESS_CODE || !response.data) {
+        throw new Error(response.info || "MCP 服务连接测试失败");
+      }
+
+      if (typeof targetProfileId === "number") {
+        setMcpConnectionStateById((prev) => ({ ...prev, [targetProfileId]: "success" }));
+      }
+      if (!options?.silent) {
+        showNotice("success", "MCP 服务连接测试成功");
+      }
+      return true;
+    } catch (error) {
+      console.error(error);
+      if (typeof targetProfileId === "number") {
+        setMcpConnectionStateById((prev) => ({ ...prev, [targetProfileId]: "failed" }));
+      }
+      if (!options?.silent) {
+        showNotice("error", error instanceof Error ? error.message : "MCP 服务连接测试失败");
+      }
+      return false;
+    } finally {
+      if (typeof targetProfileId === "number") {
+        setTestingMcpProfileId((prev) => (prev === targetProfileId ? null : prev));
+      }
+    }
+  };
+
+  const handleTestMcpProfileConnection = async (payload?: McpJsonServerConfig) => {
+    if (!userId) return;
+
+    let requestPayload: McpJsonServerConfig;
+    try {
+      requestPayload = payload ?? parseMcpJsonConfig(mcpProfileForm.configJson, mcpProfileForm.id);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "MCP JSON 解析失败");
+      return;
+    }
+
+    setMcpTesting(true);
+    try {
+      await runMcpConnectionTest(requestPayload);
+    } finally {
+      setMcpTesting(false);
+      setTestingMcpProfileId(null);
+    }
+  };
+
+  const handleTestAllMcpProfiles = async () => {
+    if (!userId) return;
+    const runnableProfiles = mcpProfiles.filter(canOperateMcpProfile);
+    if (!runnableProfiles.length) {
+      showNotice("info", "暂无可测试的 MCP 配置");
+      return;
+    }
+
+    setMcpTesting(true);
+    let successCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (const profile of runnableProfiles) {
+        const ok = await runMcpConnectionTest(buildMcpTestPayloadFromProfile(profile), { silent: true });
+        if (ok) {
+          successCount += 1;
+        } else {
+          failedCount += 1;
+        }
+      }
+    } finally {
+      setMcpTesting(false);
+      setTestingMcpProfileId(null);
+    }
+
+    if (failedCount === 0) {
+      showNotice("success", `全部测试成功，共 ${successCount} 个`);
+    } else {
+      showNotice("error", `测试完成：成功 ${successCount}，失败 ${failedCount}`);
+    }
+  };
+
+  const handleDeleteMcpProfile = async (profile: AgentMcpProfileResponseDTO) => {
+    if (!userId) return;
+    if (!canOperateMcpProfile(profile)) {
+      showNotice("info", "system 内置 MCP 不支持删除");
+      return;
+    }
+    if (!window.confirm(`确认删除 MCP 配置「${profile.name}」吗？`)) return;
+    setProfileSubmitting(true);
+    try {
+      const response = await agentService.deleteMcpProfile({
+        id: profile.id,
+        userId,
+      });
+      if (response.code !== SUCCESS_CODE) {
+        throw new Error(response.info || "删除 MCP 配置失败");
+      }
+      if (mcpProfileForm.id === profile.id) {
+        setMcpProfileForm(EMPTY_MCP_PROFILE_FORM);
+      }
+      setMcpConnectionStateById((prev) => {
+        const next = { ...prev };
+        delete next[profile.id];
+        return next;
+      });
+      await refreshAll();
+      showNotice("success", "MCP 配置已删除");
+    } catch (error) {
+      console.error(error);
+      showNotice("error", error instanceof Error ? error.message : "删除 MCP 配置失败");
+    } finally {
+      setProfileSubmitting(false);
+    }
+  };
+
+  const handleDeleteSkillProfile = async (profile: AgentSkillProfileResponseDTO) => {
+    if (!userId) return;
+    if (isSystemOwner(profile.userId)) {
+      showNotice("info", "system 内置 SKILL 不支持删除");
+      return;
+    }
+    if (!window.confirm(`确认删除 SKILL 配置「${profile.skillName}」吗？`)) return;
+    setProfileSubmitting(true);
+    try {
+      const response = await agentService.deleteSkillProfile({
+        id: profile.id,
+        userId,
+      });
+      if (response.code !== SUCCESS_CODE) {
+        throw new Error(response.info || "删除 SKILL 配置失败");
+      }
+      await refreshAll();
+      showNotice("success", "SKILL 配置已删除");
+    } catch (error) {
+      console.error(error);
+      showNotice("error", error instanceof Error ? error.message : "删除 SKILL 配置失败");
+    } finally {
+      setProfileSubmitting(false);
+    }
   };
 
   useEffect(() => {
@@ -440,7 +828,7 @@ export default function MyAgentPage() {
               </div>
             </div>
           </div>
-          <p className="text-5xl font-semibold tracking-tight text-zinc-900">{agent.agentName || "未命名Agent"}</p>
+          <p className="text-5xl font-semibold tracking-tight text-zinc-900">{agent.agentName || "未命名 Agent"}</p>
           <p className="mt-1 text-xs text-zinc-400">编号：{formatIdLabel(agent.agentId)}</p>
           <p className="mt-3 line-clamp-2 text-sm leading-6 text-zinc-500">{agent.agentDesc || "暂无描述"}</p>
           <p className="mt-1 text-xs text-zinc-400">作者：{agent.ownerUserId || userId || "admin"}</p>
@@ -461,7 +849,7 @@ export default function MyAgentPage() {
                 : "border-zinc-200 bg-white text-zinc-400 hover:bg-zinc-100 hover:text-rose-400"
             } ${isBusy ? "cursor-not-allowed opacity-60" : ""}`}
             aria-label={isSubscribed ? "unsubscribe-agent" : "subscribe-agent"}
-            title={isSubscribed ? "取消订阅" : "订阅Agent"}
+            title={isSubscribed ? "取消订阅" : "订阅 Agent"}
           >
             {isBusy ? <Loader2 size={16} className="animate-spin" /> : <Heart size={16} fill={isSubscribed ? "currentColor" : "none"} />}
           </button>
@@ -490,49 +878,13 @@ export default function MyAgentPage() {
                     onClick={(event) => {
                       event.preventDefault();
                       event.stopPropagation();
-                      void handleQuickUpdateAgent(agent);
+                      handleGoUpdateConfig(agent);
                     }}
                     disabled={isBusy}
                     className="inline-flex w-full items-center gap-1 rounded-lg px-3 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-100 disabled:opacity-60"
                   >
                     {isBusy ? <Loader2 size={14} className="animate-spin" /> : <Pencil size={14} />}
-                    快速更新
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void handlePublishAgent(agent);
-                    }}
-                    disabled={isBusy}
-                    className="inline-flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-100 disabled:opacity-60"
-                  >
-                    发布运行
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void handleOfflineAgent(agent);
-                    }}
-                    disabled={isBusy}
-                    className="inline-flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-100 disabled:opacity-60"
-                  >
-                    下线运行
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void handleRollbackAgent(agent);
-                    }}
-                    disabled={isBusy}
-                    className="inline-flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-zinc-700 hover:bg-zinc-100 disabled:opacity-60"
-                  >
-                    回滚版本
+                    更新配置
                   </button>
                   {inPlaza ? (
                     <button
@@ -647,32 +999,258 @@ export default function MyAgentPage() {
         {loading ? (
           <div className="flex min-h-40 items-center justify-center rounded-2xl border border-zinc-200 bg-white/70 text-zinc-500">
             <Loader2 className="mr-2 animate-spin" size={18} />
-            正在加载Agent列表...
+            正在加载 Agent 列表...
           </div>
         ) : activeTab === "my" ? (
           <section>
-            <p className="mb-5 text-3xl font-medium text-zinc-700">我创建的Agent</p>
-            <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="mb-5 inline-flex rounded-2xl border border-zinc-200 bg-white p-1 shadow-sm">
               <button
                 type="button"
-                onClick={() => router.push("/agent-create")}
-                className="group flex min-h-[290px] flex-col justify-center rounded-3xl border border-dashed border-blue-300 bg-white/80 p-8 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-400 hover:shadow-md"
+                onClick={() => setActiveMyTab("created")}
+                className={`rounded-xl px-5 py-2 text-sm font-medium transition ${
+                  activeMyTab === "created" ? "bg-blue-600 text-white" : "text-zinc-600 hover:bg-zinc-100"
+                }`}
               >
-                <div className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-100 text-blue-600">
-                  <Plus size={24} />
-                </div>
-                <p className="text-5xl font-semibold text-zinc-900">新建Agent</p>
-                <p className="mt-3 text-sm leading-6 text-zinc-500">点击卡片进入新建页面，创建后可按需发布到广场。</p>
+                我创建的Agent
               </button>
-
-              {myAgents.map((agent, index) => renderAgentCard(agent, index, { allowManage: true }))}
-
-              {!myAgents.length ? (
-                <div className="col-span-full rounded-2xl border border-zinc-200 bg-white/70 px-5 py-10 text-center text-zinc-500">
-                  暂无你创建的Agent，点击左侧“新建Agent”开始创建。
-                </div>
-              ) : null}
+              <button
+                type="button"
+                onClick={() => setActiveMyTab("mcp")}
+                className={`rounded-xl px-5 py-2 text-sm font-medium transition ${
+                  activeMyTab === "mcp" ? "bg-blue-600 text-white" : "text-zinc-600 hover:bg-zinc-100"
+                }`}
+              >
+                MCP
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveMyTab("skills")}
+                className={`rounded-xl px-5 py-2 text-sm font-medium transition ${
+                  activeMyTab === "skills" ? "bg-blue-600 text-white" : "text-zinc-600 hover:bg-zinc-100"
+                }`}
+              >
+                SKILLs
+              </button>
             </div>
+
+            {activeMyTab === "created" ? (
+              <>
+                <p className="mb-5 text-3xl font-medium text-zinc-700">我创建的Agent</p>
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4">
+                  <button
+                    type="button"
+                    onClick={() => router.push("/agent-create")}
+                    className="group flex min-h-[290px] flex-col justify-center rounded-3xl border border-dashed border-blue-300 bg-white/80 p-8 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-400 hover:shadow-md"
+                  >
+                    <div className="mb-5 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-100 text-blue-600">
+                      <Plus size={24} />
+                    </div>
+                    <p className="text-5xl font-semibold text-zinc-900">新建Agent</p>
+                    <p className="mt-3 text-sm leading-6 text-zinc-500">点击卡片进入新建页面，创建后可按需发布到广场。</p>
+                  </button>
+
+                  {myAgents.map((agent, index) => renderAgentCard(agent, index, { allowManage: true }))}
+
+                  {!myAgents.length ? (
+                    <div className="col-span-full rounded-2xl border border-zinc-200 bg-white/70 px-5 py-10 text-center text-zinc-500">
+                      暂无你创建的Agent，点击左侧“新建Agent”开始创建。
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            ) : activeMyTab === "mcp" ? (
+              <>
+                <p className="mb-5 text-3xl font-medium text-zinc-700">MCP 配置管理</p>
+                <div className="grid grid-cols-1 gap-5 xl:grid-cols-5">
+                  <div className="xl:col-span-2 rounded-2xl border border-zinc-200 bg-white/80 p-5 shadow-sm">
+                    <p className="mb-3 text-lg font-semibold text-zinc-800">{mcpProfileForm.id ? "更新 MCP 配置" : "新增 MCP 配置"}</p>
+                    <div className="space-y-3">
+                      <textarea
+                        className="h-72 w-full rounded-xl border border-zinc-300 px-3 py-2 font-mono text-xs outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
+                        placeholder="请输入 mcpServers JSON"
+                        value={mcpProfileForm.configJson}
+                        onChange={(event) =>
+                          setMcpProfileForm((prev) => ({ ...prev, configJson: event.target.value }))
+                        }
+                      />
+                    </div>
+
+                    <div className="mt-4 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleSaveMcpProfile()}
+                        disabled={profileSubmitting || mcpTesting}
+                        className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-60"
+                      >
+                        {profileSubmitting ? "处理中..." : mcpProfileForm.id ? "更新配置" : "创建配置"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleTestMcpProfileConnection()}
+                        disabled={profileSubmitting || mcpTesting}
+                        className="rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm text-emerald-700 hover:bg-emerald-100 disabled:opacity-60"
+                      >
+                        {mcpTesting ? "测试中..." : "测试连接"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMcpProfileForm(EMPTY_MCP_PROFILE_FORM)}
+                        disabled={profileSubmitting || mcpTesting}
+                        className="rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm text-zinc-700 hover:bg-zinc-100"
+                      >
+                        重置
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="xl:col-span-3 rounded-2xl border border-zinc-200 bg-white/80 p-5 shadow-sm">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <p className="text-lg font-semibold text-zinc-800">已保存 MCP（新建 Agent 下拉可选）</p>
+                      <button
+                        type="button"
+                        onClick={() => void handleTestAllMcpProfiles()}
+                        disabled={profileSubmitting || mcpTesting || !mcpProfiles.some(canOperateMcpProfile)}
+                        className="rounded-lg border border-sky-300 bg-sky-50 px-3 py-1 text-xs text-sky-700 hover:bg-sky-100 disabled:opacity-60"
+                      >
+                        {mcpTesting ? "测试中..." : "一键测试全部"}
+                      </button>
+                    </div>
+                    <div className="space-y-3">
+                      {mcpProfiles.map((profile) => (
+                        <div key={profile.id} className="rounded-xl border border-zinc-200 bg-white p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                {typeof profile.id === "number" && testingMcpProfileId === profile.id ? (
+                                  <Loader2 size={14} className="animate-spin text-zinc-400" />
+                                ) : (
+                                  <Circle
+                                    size={12}
+                                    className={
+                                      typeof profile.id === "number" && mcpConnectionStateById[profile.id] === "success"
+                                        ? "fill-emerald-500 text-emerald-500"
+                                        : typeof profile.id === "number" && mcpConnectionStateById[profile.id] === "failed"
+                                          ? "fill-rose-500 text-rose-500"
+                                          : "fill-zinc-300 text-zinc-300"
+                                    }
+                                  />
+                                )}
+                                <p className="truncate text-sm font-semibold text-zinc-800">{profile.name}</p>
+                              </div>
+                              {canOperateMcpProfile(profile) ? (
+                                <>
+                                  <p className="mt-1 text-xs text-zinc-500">类型: {formatMcpTypeText(profile.type)} · name: {profile.name}</p>
+                                  <p className="mt-1 truncate text-xs text-zinc-500">
+                                    {profile.baseUri}
+                                    {profile.sseEndpoint ? ` / ${profile.sseEndpoint}` : ""}
+                                  </p>
+                                </>
+                              ) : (
+                                <p className="mt-1 text-xs text-zinc-500">{profile.description || "system 内置 MCP"}</p>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {canOperateMcpProfile(profile) ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setMcpProfileForm({
+                                        id: profile.id,
+                                        configJson: buildMcpJsonFromProfile(profile),
+                                      })
+                                    }
+                                    className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                                  >
+                                    编辑
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleTestMcpProfileConnection(buildMcpTestPayloadFromProfile(profile))}
+                                    disabled={profileSubmitting || mcpTesting}
+                                    className="rounded-lg border border-emerald-200 bg-white px-3 py-1 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-60"
+                                  >
+                                    测试
+                                  </button>
+                                </>
+                              ) : null}
+                              {canOperateMcpProfile(profile) ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDeleteMcpProfile(profile)}
+                                  disabled={profileSubmitting || mcpTesting}
+                                  className="rounded-lg border border-rose-200 bg-white px-3 py-1 text-xs text-rose-700 hover:bg-rose-50"
+                                >
+                                  删除
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                      {!mcpProfiles.length ? (
+                        <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-5 text-sm text-zinc-500">
+                          还没有 MCP 配置，先在左侧创建后即可在新建 Agent 中下拉选择。
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="mb-5 flex items-center justify-between gap-3">
+                  <p className="text-3xl font-medium text-zinc-700">SKILL 配置管理</p>
+                  <button
+                    type="button"
+                    onClick={() => router.push("/skill-create")}
+                    className="inline-flex items-center gap-1 rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+                  >
+                    <Plus size={14} />
+                    新建SKILL
+                  </button>
+                </div>
+
+                <div className="rounded-2xl border border-zinc-200 bg-white/80 p-5 shadow-sm">
+                  <p className="mb-3 text-lg font-semibold text-zinc-800">已保存 SKILL（新建 Agent 下拉可选）</p>
+                  <div className="space-y-3">
+                    {skillProfiles.map((profile) => (
+                      <div key={profile.id} className="rounded-xl border border-zinc-200 bg-white p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-zinc-800">{profile.skillName}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => router.push(`/skill-create?id=${profile.id}`)}
+                              className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                            >
+                              编辑
+                            </button>
+                            {!isSystemOwner(profile.userId) ? (
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteSkillProfile(profile)}
+                                disabled={profileSubmitting}
+                                className="rounded-lg border border-rose-200 bg-white px-3 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-60"
+                              >
+                                删除
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    {!skillProfiles.length ? (
+                      <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-5 text-sm text-zinc-500">
+                        还没有 SKILL 配置，点击右上角“新建SKILL”创建。
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </>
+            )}
           </section>
         ) : activeTab === "subscribed" ? (
           <section>
@@ -707,3 +1285,6 @@ export default function MyAgentPage() {
     </div>
   );
 }
+
+
+

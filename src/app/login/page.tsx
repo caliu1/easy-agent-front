@@ -1,4 +1,9 @@
-"use client";
+﻿"use client";
+
+/**
+ * 登录注册页面：处理用户鉴权与会话初始化。
+ */
+
 
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
@@ -193,6 +198,7 @@ export default function LoginPage() {
             >
               {submitting ? "提交中..." : mode === "register" ? "注册并登录" : "登录"}
             </button>
+
           </form>
         </div>
       </section>

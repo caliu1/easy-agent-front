@@ -1,3 +1,6 @@
+/**
+ * 接口配置模块：统一拼接 API 基础地址与前缀。
+ */
 const runtimeBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   (typeof window !== "undefined"

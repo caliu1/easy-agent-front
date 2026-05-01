@@ -1,3 +1,7 @@
+﻿/**
+ * 前端 Agent API 封装：统一对后端接口的请求与返回类型约束。
+ */
+
 import { buildApiUrl } from "@/config/api-config";
 import type {
   AgentConfigDeleteRequestDTO,
@@ -10,6 +14,15 @@ import type {
   AgentConfigSubscribeRequestDTO,
   AgentConfigSummaryResponseDTO,
   AgentConfigUpsertRequestDTO,
+  AgentMcpProfileDeleteRequestDTO,
+  AgentMcpProfileResponseDTO,
+  AgentMcpProfileUpsertRequestDTO,
+  AgentSkillSaveRequestDTO,
+  AgentSkillAssetsResponseDTO,
+  AgentSkillImportResponseDTO,
+  AgentSkillProfileDeleteRequestDTO,
+  AgentSkillProfileResponseDTO,
+  AgentSkillProfileUpsertRequestDTO,
   AiAgentConfigResponseDTO,
   ApiResponse,
   ChatRequestDTO,
@@ -217,6 +230,105 @@ export const agentService = {
     });
   },
 
+  async importSkillZip(file: File, operator?: string) {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (operator && operator.trim()) {
+      formData.append("operator", operator.trim());
+    }
+
+    const response = await fetch(buildApiUrl("/agent_skill_import_zip"), {
+      method: "POST",
+      body: formData,
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response.json() as Promise<ApiResponse<AgentSkillImportResponseDTO>>;
+  },
+
+  saveSkillAssets(payload: AgentSkillSaveRequestDTO) {
+    return request<AgentSkillImportResponseDTO>(buildApiUrl("/agent_skill_save"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  querySkillAssets(ossPath: string) {
+    return request<AgentSkillAssetsResponseDTO>(
+      buildApiUrl(`/agent_skill_assets_query?ossPath=${encodeURIComponent(ossPath)}`),
+      {
+        method: "GET",
+      },
+    );
+  },
+
+  createMcpProfile(payload: AgentMcpProfileUpsertRequestDTO) {
+    return request<AgentMcpProfileResponseDTO>(buildApiUrl("/agent_mcp_profile_create"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateMcpProfile(payload: AgentMcpProfileUpsertRequestDTO) {
+    return request<AgentMcpProfileResponseDTO>(buildApiUrl("/agent_mcp_profile_update"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteMcpProfile(payload: AgentMcpProfileDeleteRequestDTO) {
+    return request<boolean>(buildApiUrl("/agent_mcp_profile_delete"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  queryMcpProfileList(userId: string) {
+    return request<AgentMcpProfileResponseDTO[]>(
+      buildApiUrl(`/agent_mcp_profile_list?userId=${encodeURIComponent(userId)}`),
+      { method: "GET" },
+    );
+  },
+
+  testMcpProfileConnection(payload: AgentMcpProfileUpsertRequestDTO) {
+    return request<boolean>(buildApiUrl("/agent_mcp_profile_test"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  createSkillProfile(payload: AgentSkillProfileUpsertRequestDTO) {
+    return request<AgentSkillProfileResponseDTO>(buildApiUrl("/agent_skill_profile_create"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateSkillProfile(payload: AgentSkillProfileUpsertRequestDTO) {
+    return request<AgentSkillProfileResponseDTO>(buildApiUrl("/agent_skill_profile_update"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteSkillProfile(payload: AgentSkillProfileDeleteRequestDTO) {
+    return request<boolean>(buildApiUrl("/agent_skill_profile_delete"), {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  querySkillProfileList(userId: string) {
+    return request<AgentSkillProfileResponseDTO[]>(
+      buildApiUrl(`/agent_skill_profile_list?userId=${encodeURIComponent(userId)}`),
+      { method: "GET" },
+    );
+  },
+
   createSession(payload: CreateSessionRequestDTO) {
     return request<CreateSessionResponseDTO>(buildApiUrl("/create_session"), {
       method: "POST",
@@ -289,19 +401,17 @@ export const agentService = {
     const decoder = new TextDecoder();
     let buffer = "";
 
-    const dispatchEvent = async (payloadText: string) => {
+    const dispatchEvent = (payloadText: string) => {
       if (!payloadText || payloadText === "[DONE]") return;
       try {
         const event = JSON.parse(payloadText) as ChatStreamEventResponseDTO;
         onEvent(event);
-        // Yield once so React has a chance to paint incremental updates.
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
       } catch (error) {
         console.warn("Failed to parse stream event", payloadText, error);
       }
     };
 
-    const flushBlocks = async (isTail: boolean) => {
+    const flushBlocks = (isTail: boolean) => {
       const separator = /\r?\n\r?\n/;
       const blocks = buffer.split(separator);
       buffer = isTail ? "" : blocks.pop() ?? "";
@@ -320,7 +430,7 @@ export const agentService = {
         }
 
         const payloadText = dataLines.join("\n").trim();
-        await dispatchEvent(payloadText);
+        dispatchEvent(payloadText);
       }
     };
 
@@ -329,10 +439,10 @@ export const agentService = {
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      await flushBlocks(false);
+      flushBlocks(false);
     }
 
     buffer += decoder.decode();
-    await flushBlocks(true);
+    flushBlocks(true);
   },
 };

@@ -4,9 +4,20 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a8644434-072b-4e94-abdd-4ea7e102aec6" name="Changes" comment="adk风格ui">
+    <list default="true" id="a8644434-072b-4e94-abdd-4ea7e102aec6" name="Changes" comment="前端优化，会话框、状态框可收起">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/next.config.ts" beforeDir="false" afterPath="$PROJECT_DIR$/next.config.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/push.sh" beforeDir="false" afterPath="$PROJECT_DIR$/push.sh" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/api/agent.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/api/agent.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/agent-admin/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/agent-admin/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/agent-create/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/agent-create/page.tsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/app/chat/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/chat/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/layout.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/layout.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/login/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/login/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/app/page.tsx" beforeDir="false" afterPath="$PROJECT_DIR$/src/app/page.tsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/config/api-config.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/config/api-config.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/types/api.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/types/api.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/utils/cookie.ts" beforeDir="false" afterPath="$PROJECT_DIR$/src/utils/cookie.ts" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -57,6 +68,7 @@
   &quot;keyToString&quot;: {
     &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultAutoModeForALLUsers.v1&quot;: &quot;true&quot;,
     &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1&quot;: &quot;true&quot;,
@@ -111,7 +123,10 @@
       <workItem from="1777050439486" duration="1690000" />
       <workItem from="1777084910758" duration="32000" />
       <workItem from="1777094350399" duration="3273000" />
-      <workItem from="1777208872344" duration="622000" />
+      <workItem from="1777208872344" duration="6539000" />
+      <workItem from="1777338970443" duration="2443000" />
+      <workItem from="1777366270060" duration="2916000" />
+      <workItem from="1777469332959" duration="10791000" />
     </task>
     <task id="LOCAL-00001" summary="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现">
       <option name="closed" value="true" />
@@ -129,7 +144,15 @@
       <option name="project" value="LOCAL" />
       <updated>1777190992307</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="ui优化">
+      <option name="closed" value="true" />
+      <created>1777210197482</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1777210197482</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -149,6 +172,8 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="跟随后端更新增加drawio skill, 会话历史由前端转到后端实现" />
     <MESSAGE value="adk风格ui" />
-    <option name="LAST_COMMIT_MESSAGE" value="adk风格ui" />
+    <MESSAGE value="ui优化" />
+    <MESSAGE value="前端优化，会话框、状态框可收起" />
+    <option name="LAST_COMMIT_MESSAGE" value="前端优化，会话框、状态框可收起" />
   </component>
 </project>

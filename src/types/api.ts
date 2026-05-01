@@ -1,3 +1,7 @@
+﻿/**
+ * 前后端接口类型定义：集中维护 DTO 与响应结构。
+ */
+
 export interface ApiResponse<T> {
   code: string;
   info: string;
@@ -88,7 +92,7 @@ export interface SessionHistoryMessageResponseDTO {
 }
 
 export interface AgentConfigUpsertRequestDTO {
-  agentId: string;
+  agentId?: string;
   appName?: string;
   agentName?: string;
   agentDesc?: string;
@@ -176,4 +180,130 @@ export interface AgentConfigPageResponseDTO {
   pageSize: number;
   total: number;
   records: AgentConfigSummaryResponseDTO[];
+}
+
+export interface AgentSkillImportItemDTO {
+  type: string;
+  path: string;
+  skillName?: string;
+}
+
+export interface AgentSkillImportResponseDTO {
+  bucket: string;
+  prefix: string;
+  fileCount: number;
+  skillCount: number;
+  toolSkillsList: AgentSkillImportItemDTO[];
+}
+
+export interface AgentSkillSaveEntryDTO {
+  kind: "file" | "folder";
+  path: string;
+  content?: string;
+}
+
+export interface AgentSkillSaveRequestDTO {
+  operator?: string;
+  rootFolder: string;
+  entries: AgentSkillSaveEntryDTO[];
+}
+
+export interface AgentSkillAssetsEntryDTO {
+  kind: "file" | "folder";
+  path: string;
+  content?: string;
+}
+
+export interface AgentSkillAssetsResponseDTO {
+  bucket: string;
+  prefix: string;
+  fileCount: number;
+  folderCount: number;
+  entries: AgentSkillAssetsEntryDTO[];
+}
+
+export interface AgentMcpProfileUpsertRequestDTO {
+  id?: number;
+  userId: string;
+  /**
+   * Preferred: complete MCP json config.
+   */
+  configJson?: string;
+  description?: string;
+  type: "sse" | "streamableHttp";
+  name: string;
+  baseUri?: string;
+  /**
+   * SSE 时表示 sseEndpoint；streamableHttp 时表示 endpoint。
+   */
+  sseEndpoint?: string;
+  requestTimeout?: number;
+  /**
+   * none | bearer | apiKey
+   */
+  authType?: string;
+  /**
+   * bearer token / apiKey value
+   */
+  authToken?: string;
+  /**
+   * header key when authType=apiKey
+   */
+  authKeyName?: string;
+  /**
+   * JSON object string for headers
+   */
+  headersJson?: string;
+  /**
+   * JSON object string for query params
+   */
+  queryJson?: string;
+}
+
+export interface AgentMcpProfileDeleteRequestDTO {
+  id: number;
+  userId: string;
+}
+
+export interface AgentMcpProfileResponseDTO {
+  id?: number;
+  userId?: string;
+  configJson?: string;
+  description?: string;
+  type?: "sse" | "streamableHttp" | string;
+  name: string;
+  baseUri?: string;
+  /**
+   * SSE 时表示 sseEndpoint；streamableHttp 时表示 endpoint。
+   */
+  sseEndpoint?: string;
+  requestTimeout?: number;
+  authType?: string;
+  authToken?: string;
+  authKeyName?: string;
+  headersJson?: string;
+  queryJson?: string;
+  createTime?: number;
+  updateTime?: number;
+}
+
+export interface AgentSkillProfileUpsertRequestDTO {
+  id?: number;
+  userId: string;
+  skillName: string;
+  ossPath: string;
+}
+
+export interface AgentSkillProfileDeleteRequestDTO {
+  id: number;
+  userId: string;
+}
+
+export interface AgentSkillProfileResponseDTO {
+  id: number;
+  userId: string;
+  skillName: string;
+  ossPath: string;
+  createTime?: number;
+  updateTime?: number;
 }
