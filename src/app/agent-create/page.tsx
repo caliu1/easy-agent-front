@@ -156,19 +156,6 @@ const normalizeMcpTransportType = (type?: string): McpTransportType => {
   return type === "streamableHttp" ? "streamableHttp" : "sse";
 };
 
-const buildToolMcpFromProfile = (profile: AgentMcpProfileResponseDTO): ToolMcpItem => ({
-  type: normalizeMcpTransportType(profile.type),
-  name: profile.name || "",
-  baseUri: profile.baseUri || "",
-  endpoint: profile.sseEndpoint || "",
-  requestTimeout: String(profile.requestTimeout ?? 3000),
-  authType: profile.authType || "",
-  authToken: profile.authToken || "",
-  authKeyName: profile.authKeyName || "",
-  headersJson: profile.headersJson || "",
-  queryJson: profile.queryJson || "",
-});
-
 const buildToolSkillFromProfile = (profile: AgentSkillProfileResponseDTO): ToolSkillItem => {
   const defaultSkillAsset = createDefaultSkillMarkdownAsset();
   const normalizedPath = normalizeSkillPath(profile.ossPath || "");
@@ -186,22 +173,6 @@ const buildToolSkillFromProfile = (profile: AgentSkillProfileResponseDTO): ToolS
     newFolderPath: "",
   };
 };
-
-const mcpProfileSignature = (item: Pick<ToolMcpItem, "type" | "name" | "baseUri" | "endpoint">) =>
-  [
-    normalizeMcpTransportType(item.type),
-    item.name.trim(),
-    item.baseUri.trim(),
-    item.endpoint.trim(),
-  ].join("::");
-
-const mcpSignatureFromProfile = (profile: AgentMcpProfileResponseDTO) =>
-  [
-    normalizeMcpTransportType(profile.type),
-    (profile.name || "").trim(),
-    (profile.baseUri || "").trim(),
-    (profile.sseEndpoint || "").trim(),
-  ].join("::");
 
 const normalizeSkillPath = (path: string) => path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
 const normalizeSkillPathLoose = (path: string) => normalizeSkillPath(path).toLowerCase();
@@ -940,9 +911,9 @@ export default function AgentCreatePage() {
   const [form, setForm] = useState<CreateForm>(INITIAL_FORM);
   const [mcpProfiles, setMcpProfiles] = useState<AgentMcpProfileResponseDTO[]>([]);
   const [skillProfiles, setSkillProfiles] = useState<AgentSkillProfileResponseDTO[]>([]);
-  const [selectedMcpProfileIds, setSelectedMcpProfileIds] = useState<number[]>([]);
+  const [selectedMcpProfileNames, setSelectedMcpProfileNames] = useState<string[]>([]);
   const [selectedSkillProfileIds, setSelectedSkillProfileIds] = useState<number[]>([]);
-  const [pendingMcpProfileId, setPendingMcpProfileId] = useState("");
+  const [pendingMcpProfileName, setPendingMcpProfileName] = useState("");
   const [pendingSkillProfileId, setPendingSkillProfileId] = useState("");
   const [toolProfilesLoaded, setToolProfilesLoaded] = useState(false);
   const [profileSelectionInitialized, setProfileSelectionInitialized] = useState(false);
@@ -982,8 +953,8 @@ export default function AgentCreatePage() {
     if (!form.model.trim()) return "请填写模型";
     if (form.autoPublish && !form.apiKey.trim()) return "勾选自动发布时必须填写 API Key";
 
-    const hasMissingMcpProfile = selectedMcpProfileIds.some(
-      (id) => !mcpProfiles.some((profile) => profile.id === id),
+    const hasMissingMcpProfile = selectedMcpProfileNames.some(
+      (name) => !mcpProfiles.some((profile) => (profile.name || "").trim() === name.trim()),
     );
     if (hasMissingMcpProfile) {
       return "选中的 MCP 配置不存在，请刷新后重选";
@@ -1110,19 +1081,19 @@ export default function AgentCreatePage() {
     if (skillResponse.code !== SUCCESS_CODE) {
       throw new Error(skillResponse.info || "加载 SKILL 配置失败");
     }
-    setMcpProfiles((mcpResponse.data ?? []).filter((profile) => typeof profile.id === "number"));
+    setMcpProfiles(mcpResponse.data ?? []);
     setSkillProfiles(skillResponse.data ?? []);
   }, [operator]);
 
   const addSelectedMcpProfile = () => {
-    const id = Number(pendingMcpProfileId);
-    if (!Number.isInteger(id) || id <= 0) return;
-    setSelectedMcpProfileIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
-    setPendingMcpProfileId("");
+    const name = pendingMcpProfileName.trim();
+    if (!name) return;
+    setSelectedMcpProfileNames((prev) => (prev.includes(name) ? prev : [...prev, name]));
+    setPendingMcpProfileName("");
   };
 
-  const removeSelectedMcpProfile = (id: number) => {
-    setSelectedMcpProfileIds((prev) => prev.filter((profileId) => profileId !== id));
+  const removeSelectedMcpProfile = (name: string) => {
+    setSelectedMcpProfileNames((prev) => prev.filter((item) => item !== name));
   };
 
   const addSelectedSkillProfile = () => {
@@ -1180,10 +1151,11 @@ export default function AgentCreatePage() {
 
     setCreating(true);
     try {
-      const selectedToolMcpList = selectedMcpProfileIds
-        .map((id) => mcpProfiles.find((profile) => profile.id === id))
-        .filter((profile): profile is AgentMcpProfileResponseDTO => Boolean(profile))
-        .map((profile) => buildToolMcpFromProfile(profile));
+      const selectedMcpNames = selectedMcpProfileNames
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0)
+        .filter((name, index, arr) => arr.indexOf(name) === index)
+        .filter((name) => mcpProfiles.some((profile) => (profile.name || "").trim() === name));
 
       const selectedToolSkillsList = selectedSkillProfileIds
         .map((id) => skillProfiles.find((profile) => profile.id === id))
@@ -1192,13 +1164,13 @@ export default function AgentCreatePage() {
 
       const formForSave: CreateForm = {
         ...form,
-        toolMcpList: selectedToolMcpList,
+        toolMcpList: [],
         toolSkillsList: selectedToolSkillsList,
       };
 
       setForm((prev) => ({
         ...prev,
-        toolMcpList: selectedToolMcpList,
+        toolMcpList: [],
         toolSkillsList: selectedToolSkillsList,
       }));
 
@@ -1208,6 +1180,8 @@ export default function AgentCreatePage() {
         agentDesc: formForSave.agentDesc.trim(),
         configJson: buildConfigJsonFromForm(formForSave, isEditMode ? editingAgentId : undefined),
         operator,
+        ownerUserId: operator,
+        selectedMcpNames,
       };
 
       if (isEditMode && !editingAgentId.trim()) {
@@ -1435,13 +1409,10 @@ export default function AgentCreatePage() {
     if (!toolProfilesLoaded || profileSelectionInitialized) return;
     if (isEditMode && loadingEditDetail) return;
 
-    const matchedMcpIds = form.toolMcpList
-      .map((item) => {
-        const signature = mcpProfileSignature(item);
-        const matched = mcpProfiles.find((profile) => mcpSignatureFromProfile(profile) === signature);
-        return matched?.id;
-      })
-      .filter((id): id is number => typeof id === "number");
+    const matchedMcpNames = form.toolMcpList
+      .map((item) => (item.name || "").trim())
+      .filter((name) => name.length > 0)
+      .filter((name) => mcpProfiles.some((profile) => (profile.name || "").trim() === name));
 
     const matchedSkillIds = form.toolSkillsList
       .map((item) => {
@@ -1451,7 +1422,7 @@ export default function AgentCreatePage() {
       })
       .filter((id): id is number => typeof id === "number");
 
-    setSelectedMcpProfileIds(Array.from(new Set(matchedMcpIds)));
+    setSelectedMcpProfileNames(Array.from(new Set(matchedMcpNames)));
     setSelectedSkillProfileIds(Array.from(new Set(matchedSkillIds)));
     setProfileSelectionInitialized(true);
   }, [
@@ -1468,11 +1439,6 @@ export default function AgentCreatePage() {
   useEffect(() => {
     if (!profileSelectionInitialized) return;
 
-    const selectedMcp = selectedMcpProfileIds
-      .map((id) => mcpProfiles.find((profile) => profile.id === id))
-      .filter((item): item is AgentMcpProfileResponseDTO => Boolean(item))
-      .map((profile) => buildToolMcpFromProfile(profile));
-
     const selectedSkills = selectedSkillProfileIds
       .map((id) => skillProfiles.find((profile) => profile.id === id))
       .filter((item): item is AgentSkillProfileResponseDTO => Boolean(item))
@@ -1480,10 +1446,9 @@ export default function AgentCreatePage() {
 
     setForm((prev) => ({
       ...prev,
-      toolMcpList: selectedMcp,
       toolSkillsList: selectedSkills,
     }));
-  }, [mcpProfiles, profileSelectionInitialized, selectedMcpProfileIds, selectedSkillProfileIds, skillProfiles]);
+  }, [profileSelectionInitialized, selectedSkillProfileIds, skillProfiles]);
 
   useEffect(() => {
     const viewport = assistantViewportRef.current;
@@ -1653,13 +1618,13 @@ export default function AgentCreatePage() {
                 <div className="mb-3 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
                   <select
                     className="rounded-xl border border-zinc-300 px-3 py-2 text-sm outline-none ring-blue-200 transition focus:border-blue-400 focus:ring-2"
-                    value={pendingMcpProfileId}
-                    onChange={(event) => setPendingMcpProfileId(event.target.value)}
+                    value={pendingMcpProfileName}
+                    onChange={(event) => setPendingMcpProfileName(event.target.value)}
                   >
                     <option value="">请选择已保存的 MCP 配置</option>
-                    {mcpProfiles.map((profile) => (
-                      <option key={profile.id} value={profile.id}>
-                        {profile.name} ({normalizeMcpTransportType(profile.type)})
+                    {mcpProfiles.map((profile, index) => (
+                      <option key={`${profile.name || "mcp"}-${index}`} value={profile.name || ""}>
+                        {profile.name} {profile.description ? `- ${profile.description}` : ""}
                       </option>
                     ))}
                   </select>
@@ -1672,31 +1637,25 @@ export default function AgentCreatePage() {
                   </button>
                 </div>
 
-                {selectedMcpProfileIds.length === 0 ? (
+                {selectedMcpProfileNames.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-4 text-sm text-zinc-500">
                     未选择 MCP。请先在首页 MCP 标签中维护配置，然后在这里下拉选择。
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {selectedMcpProfileIds.map((profileId) => {
-                      const profile = mcpProfiles.find((item) => item.id === profileId);
+                    {selectedMcpProfileNames.map((profileName) => {
+                      const profile = mcpProfiles.find((item) => (item.name || "").trim() === profileName);
                       if (!profile) return null;
                       return (
-                        <div key={profileId} className="rounded-xl border border-zinc-200 bg-white p-3">
+                        <div key={profileName} className="rounded-xl border border-zinc-200 bg-white p-3">
                           <div className="flex items-start justify-between gap-2">
                             <div className="min-w-0">
                               <div className="truncate text-sm font-semibold text-zinc-800">{profile.name}</div>
-                              <div className="mt-1 text-xs text-zinc-500">
-                                {normalizeMcpTransportType(profile.type)} · {profile.name}
-                              </div>
-                              <div className="mt-1 truncate text-xs text-zinc-500">
-                                {profile.baseUri}
-                                {profile.sseEndpoint ? ` / ${profile.sseEndpoint}` : ""}
-                              </div>
+                              <div className="mt-1 truncate text-xs text-zinc-500">{profile.description || "无描述"}</div>
                             </div>
                             <button
                               type="button"
-                              onClick={() => removeSelectedMcpProfile(profileId)}
+                              onClick={() => removeSelectedMcpProfile(profileName)}
                               className="inline-flex items-center gap-1 rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
                             >
                               <Trash2 size={12} />

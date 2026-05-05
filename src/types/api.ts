@@ -101,6 +101,7 @@ export interface AgentConfigUpsertRequestDTO {
   ownerUserId?: string;
   sourceType?: string;
   plazaStatus?: string;
+  selectedMcpNames?: string[];
 }
 
 export interface AgentConfigDeleteRequestDTO {
@@ -268,6 +269,7 @@ export interface AgentMcpProfileDeleteRequestDTO {
 export interface AgentMcpProfileResponseDTO {
   id?: number;
   userId?: string;
+  systemProvided?: boolean;
   configJson?: string;
   description?: string;
   type?: "sse" | "streamableHttp" | string;
@@ -302,6 +304,7 @@ export interface AgentSkillProfileDeleteRequestDTO {
 export interface AgentSkillProfileResponseDTO {
   id: number;
   userId: string;
+  systemProvided?: boolean;
   skillName: string;
   ossPath: string;
   createTime?: number;

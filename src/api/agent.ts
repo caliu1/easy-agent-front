@@ -294,6 +294,15 @@ export const agentService = {
     );
   },
 
+  queryMcpProfileDetail(userId: string, mcpName: string) {
+    return request<AgentMcpProfileResponseDTO>(
+      buildApiUrl(
+        `/agent_mcp_profile_detail?userId=${encodeURIComponent(userId)}&mcpName=${encodeURIComponent(mcpName)}`,
+      ),
+      { method: "GET" },
+    );
+  },
+
   testMcpProfileConnection(payload: AgentMcpProfileUpsertRequestDTO) {
     return request<boolean>(buildApiUrl("/agent_mcp_profile_test"), {
       method: "POST",

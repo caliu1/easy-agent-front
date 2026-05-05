@@ -85,11 +85,6 @@ const formatStatusText = (status?: string) => {
   return status || "未知";
 };
 
-const formatMcpTypeText = (type?: string) => {
-  if (type === "streamableHttp") return "streamableHttp";
-  return "sse";
-};
-
 const isObjectRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 };
@@ -275,8 +270,12 @@ const isSystemOwner = (ownerUserId?: string) => {
   return (ownerUserId || "").trim().toLowerCase() === SYSTEM_USER_ID;
 };
 
-const canOperateMcpProfile = (profile: AgentMcpProfileResponseDTO) => {
-  return typeof profile.id === "number" && !isSystemOwner(profile.userId);
+const isSystemMcpProfile = (profile: AgentMcpProfileResponseDTO) => {
+  return profile.systemProvided === true || isSystemOwner(profile.userId);
+};
+
+const isSystemSkillProfile = (profile: AgentSkillProfileResponseDTO) => {
+  return profile.systemProvided === true || isSystemOwner(profile.userId);
 };
 
 export default function MyAgentPage() {
@@ -296,8 +295,8 @@ export default function MyAgentPage() {
   const [mcpProfileForm, setMcpProfileForm] = useState<McpProfileForm>(EMPTY_MCP_PROFILE_FORM);
   const [profileSubmitting, setProfileSubmitting] = useState(false);
   const [mcpTesting, setMcpTesting] = useState(false);
-  const [mcpConnectionStateById, setMcpConnectionStateById] = useState<Record<number, McpConnectionState>>({});
-  const [testingMcpProfileId, setTestingMcpProfileId] = useState<number | null>(null);
+  const [mcpConnectionStateByName, setMcpConnectionStateByName] = useState<Record<string, McpConnectionState>>({});
+  const [testingMcpProfileName, setTestingMcpProfileName] = useState<string | null>(null);
 
   const avatarPalette = useMemo(
     () => [
@@ -575,6 +574,18 @@ export default function MyAgentPage() {
     }
   };
 
+  const loadMcpProfileDetailByName = async (profileName: string): Promise<AgentMcpProfileResponseDTO> => {
+    const normalizedName = (profileName || "").trim();
+    if (!normalizedName) {
+      throw new Error("MCP 名称为空");
+    }
+    const response = await agentService.queryMcpProfileDetail(userId, normalizedName);
+    if (response.code !== SUCCESS_CODE || !response.data) {
+      throw new Error(response.info || `加载 MCP 详情失败：${normalizedName}`);
+    }
+    return response.data;
+  };
+
   const buildMcpTestPayloadFromProfile = (profile: AgentMcpProfileResponseDTO): McpJsonServerConfig => ({
     id: profile.id,
     configJson: buildMcpJsonFromProfile(profile),
@@ -595,9 +606,9 @@ export default function MyAgentPage() {
     requestPayload: McpJsonServerConfig,
     options?: { silent?: boolean },
   ): Promise<boolean> => {
-    const targetProfileId = requestPayload.id;
-    if (typeof targetProfileId === "number") {
-      setTestingMcpProfileId(targetProfileId);
+    const targetProfileName = (requestPayload.name || "").trim();
+    if (targetProfileName) {
+      setTestingMcpProfileName(targetProfileName);
     }
 
     try {
@@ -621,8 +632,8 @@ export default function MyAgentPage() {
         throw new Error(response.info || "MCP 服务连接测试失败");
       }
 
-      if (typeof targetProfileId === "number") {
-        setMcpConnectionStateById((prev) => ({ ...prev, [targetProfileId]: "success" }));
+      if (targetProfileName) {
+        setMcpConnectionStateByName((prev) => ({ ...prev, [targetProfileName]: "success" }));
       }
       if (!options?.silent) {
         showNotice("success", "MCP 服务连接测试成功");
@@ -630,16 +641,16 @@ export default function MyAgentPage() {
       return true;
     } catch (error) {
       console.error(error);
-      if (typeof targetProfileId === "number") {
-        setMcpConnectionStateById((prev) => ({ ...prev, [targetProfileId]: "failed" }));
+      if (targetProfileName) {
+        setMcpConnectionStateByName((prev) => ({ ...prev, [targetProfileName]: "failed" }));
       }
       if (!options?.silent) {
         showNotice("error", error instanceof Error ? error.message : "MCP 服务连接测试失败");
       }
       return false;
     } finally {
-      if (typeof targetProfileId === "number") {
-        setTestingMcpProfileId((prev) => (prev === targetProfileId ? null : prev));
+      if (targetProfileName) {
+        setTestingMcpProfileName((prev) => (prev === targetProfileName ? null : prev));
       }
     }
   };
@@ -660,14 +671,50 @@ export default function MyAgentPage() {
       await runMcpConnectionTest(requestPayload);
     } finally {
       setMcpTesting(false);
-      setTestingMcpProfileId(null);
+      setTestingMcpProfileName(null);
+    }
+  };
+
+  const handleEditMcpProfile = async (profileName: string) => {
+    if (!userId) return;
+    if (!profileName.trim()) return;
+    try {
+      const detail = await loadMcpProfileDetailByName(profileName);
+      if (isSystemOwner(detail.userId)) {
+        showNotice("info", "system 内置 MCP 不支持编辑");
+        return;
+      }
+      setMcpProfileForm({
+        id: detail.id,
+        configJson: buildMcpJsonFromProfile(detail),
+      });
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "加载 MCP 详情失败");
+    }
+  };
+
+  const handleTestSavedMcpProfile = async (profileName: string) => {
+    if (!userId) return;
+    if (!profileName.trim()) return;
+    try {
+      const detail = await loadMcpProfileDetailByName(profileName);
+      if (isSystemOwner(detail.userId)) {
+        showNotice("info", "system 内置 MCP 不支持连接测试");
+        return;
+      }
+      setMcpTesting(true);
+      await runMcpConnectionTest(buildMcpTestPayloadFromProfile(detail));
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "MCP 服务连接测试失败");
+    } finally {
+      setMcpTesting(false);
+      setTestingMcpProfileName(null);
     }
   };
 
   const handleTestAllMcpProfiles = async () => {
     if (!userId) return;
-    const runnableProfiles = mcpProfiles.filter(canOperateMcpProfile);
-    if (!runnableProfiles.length) {
+    if (!mcpProfiles.length) {
       showNotice("info", "暂无可测试的 MCP 配置");
       return;
     }
@@ -677,17 +724,27 @@ export default function MyAgentPage() {
     let failedCount = 0;
 
     try {
-      for (const profile of runnableProfiles) {
-        const ok = await runMcpConnectionTest(buildMcpTestPayloadFromProfile(profile), { silent: true });
-        if (ok) {
-          successCount += 1;
-        } else {
+      for (const profile of mcpProfiles) {
+        if (!profile.name) continue;
+        if (isSystemMcpProfile(profile)) continue;
+        try {
+          const detail = await loadMcpProfileDetailByName(profile.name);
+          if (isSystemOwner(detail.userId)) {
+            continue;
+          }
+          const ok = await runMcpConnectionTest(buildMcpTestPayloadFromProfile(detail), { silent: true });
+          if (ok) {
+            successCount += 1;
+          } else {
+            failedCount += 1;
+          }
+        } catch {
           failedCount += 1;
         }
       }
     } finally {
       setMcpTesting(false);
-      setTestingMcpProfileId(null);
+      setTestingMcpProfileName(null);
     }
 
     if (failedCount === 0) {
@@ -697,30 +754,50 @@ export default function MyAgentPage() {
     }
   };
 
-  const handleDeleteMcpProfile = async (profile: AgentMcpProfileResponseDTO) => {
+  const handleDeleteMcpProfile = async (profileName: string) => {
     if (!userId) return;
-    if (!canOperateMcpProfile(profile)) {
+    if (!profileName.trim()) return;
+
+    let detail: AgentMcpProfileResponseDTO;
+    try {
+      detail = await loadMcpProfileDetailByName(profileName);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "加载 MCP 详情失败");
+      return;
+    }
+    if (isSystemOwner(detail.userId)) {
       showNotice("info", "system 内置 MCP 不支持删除");
       return;
     }
-    if (!window.confirm(`确认删除 MCP 配置「${profile.name}」吗？`)) return;
+    if (detail.id == null) {
+      showNotice("error", "删除失败：MCP 配置 ID 不存在");
+      return;
+    }
+
+    if (!window.confirm(`确认删除 MCP 配置「${detail.name}」吗？`)) return;
+
     setProfileSubmitting(true);
+
     try {
       const response = await agentService.deleteMcpProfile({
-        id: profile.id,
+        id: detail.id,
         userId,
       });
+
       if (response.code !== SUCCESS_CODE) {
         throw new Error(response.info || "删除 MCP 配置失败");
       }
-      if (mcpProfileForm.id === profile.id) {
+
+      if (mcpProfileForm.id === detail.id) {
         setMcpProfileForm(EMPTY_MCP_PROFILE_FORM);
       }
-      setMcpConnectionStateById((prev) => {
+
+      setMcpConnectionStateByName((prev) => {
         const next = { ...prev };
-        delete next[profile.id];
+        delete next[profileName];
         return next;
       });
+
       await refreshAll();
       showNotice("success", "MCP 配置已删除");
     } catch (error) {
@@ -733,7 +810,7 @@ export default function MyAgentPage() {
 
   const handleDeleteSkillProfile = async (profile: AgentSkillProfileResponseDTO) => {
     if (!userId) return;
-    if (isSystemOwner(profile.userId)) {
+    if (isSystemSkillProfile(profile)) {
       showNotice("info", "system 内置 SKILL 不支持删除");
       return;
     }
@@ -1109,85 +1186,74 @@ export default function MyAgentPage() {
                       <button
                         type="button"
                         onClick={() => void handleTestAllMcpProfiles()}
-                        disabled={profileSubmitting || mcpTesting || !mcpProfiles.some(canOperateMcpProfile)}
+                        disabled={profileSubmitting || mcpTesting || !mcpProfiles.length}
                         className="rounded-lg border border-sky-300 bg-sky-50 px-3 py-1 text-xs text-sky-700 hover:bg-sky-100 disabled:opacity-60"
                       >
                         {mcpTesting ? "测试中..." : "一键测试全部"}
                       </button>
                     </div>
                     <div className="space-y-3">
-                      {mcpProfiles.map((profile) => (
-                        <div key={profile.id} className="rounded-xl border border-zinc-200 bg-white p-3">
+                      {mcpProfiles.map((profile, index) => {
+                        const profileName = (profile.name || "").trim();
+                        const connectionState = profileName ? mcpConnectionStateByName[profileName] : undefined;
+                        return (
+                        <div key={`${profileName || "mcp"}-${index}`} className="rounded-xl border border-zinc-200 bg-white p-3">
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
                               <div className="flex items-center gap-2">
-                                {typeof profile.id === "number" && testingMcpProfileId === profile.id ? (
+                                {profileName && testingMcpProfileName === profileName ? (
                                   <Loader2 size={14} className="animate-spin text-zinc-400" />
                                 ) : (
                                   <Circle
                                     size={12}
                                     className={
-                                      typeof profile.id === "number" && mcpConnectionStateById[profile.id] === "success"
+                                      connectionState === "success"
                                         ? "fill-emerald-500 text-emerald-500"
-                                        : typeof profile.id === "number" && mcpConnectionStateById[profile.id] === "failed"
+                                        : connectionState === "failed"
                                           ? "fill-rose-500 text-rose-500"
                                           : "fill-zinc-300 text-zinc-300"
                                     }
                                   />
                                 )}
                                 <p className="truncate text-sm font-semibold text-zinc-800">{profile.name}</p>
+                                {isSystemMcpProfile(profile) ? (
+                                  <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] text-sky-700">
+                                    系统
+                                  </span>
+                                ) : null}
                               </div>
-                              {canOperateMcpProfile(profile) ? (
-                                <>
-                                  <p className="mt-1 text-xs text-zinc-500">类型: {formatMcpTypeText(profile.type)} · name: {profile.name}</p>
-                                  <p className="mt-1 truncate text-xs text-zinc-500">
-                                    {profile.baseUri}
-                                    {profile.sseEndpoint ? ` / ${profile.sseEndpoint}` : ""}
-                                  </p>
-                                </>
-                              ) : (
-                                <p className="mt-1 text-xs text-zinc-500">{profile.description || "system 内置 MCP"}</p>
-                              )}
+                              <p className="mt-1 text-xs text-zinc-500">{profile.description || "无描述"}</p>
                             </div>
-                            <div className="flex items-center gap-2">
-                              {canOperateMcpProfile(profile) ? (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setMcpProfileForm({
-                                        id: profile.id,
-                                        configJson: buildMcpJsonFromProfile(profile),
-                                      })
-                                    }
-                                    className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
-                                  >
-                                    编辑
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleTestMcpProfileConnection(buildMcpTestPayloadFromProfile(profile))}
-                                    disabled={profileSubmitting || mcpTesting}
-                                    className="rounded-lg border border-emerald-200 bg-white px-3 py-1 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-60"
-                                  >
-                                    测试
-                                  </button>
-                                </>
-                              ) : null}
-                              {canOperateMcpProfile(profile) ? (
+                            {!isSystemMcpProfile(profile) ? (
+                              <div className="flex items-center gap-2">
                                 <button
                                   type="button"
-                                  onClick={() => void handleDeleteMcpProfile(profile)}
+                                  onClick={() => void handleEditMcpProfile(profileName)}
+                                  className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                                >
+                                  编辑
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleTestSavedMcpProfile(profileName)}
+                                  disabled={profileSubmitting || mcpTesting}
+                                  className="rounded-lg border border-emerald-200 bg-white px-3 py-1 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-60"
+                                >
+                                  测试
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDeleteMcpProfile(profileName)}
                                   disabled={profileSubmitting || mcpTesting}
                                   className="rounded-lg border border-rose-200 bg-white px-3 py-1 text-xs text-rose-700 hover:bg-rose-50"
                                 >
                                   删除
                                 </button>
-                              ) : null}
-                            </div>
+                              </div>
+                            ) : null}
                           </div>
                         </div>
-                      ))}
+                      )})}
                       {!mcpProfiles.length ? (
                         <div className="rounded-xl border border-dashed border-zinc-300 bg-white px-3 py-5 text-sm text-zinc-500">
                           还没有 MCP 配置，先在左侧创建后即可在新建 Agent 中下拉选择。
@@ -1218,17 +1284,24 @@ export default function MyAgentPage() {
                       <div key={profile.id} className="rounded-xl border border-zinc-200 bg-white p-3">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-zinc-800">{profile.skillName}</p>
+                            <div className="flex items-center gap-2">
+                              <p className="truncate text-sm font-semibold text-zinc-800">{profile.skillName}</p>
+                              {isSystemSkillProfile(profile) ? (
+                                <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] text-sky-700">
+                                  系统
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => router.push(`/skill-create?id=${profile.id}`)}
-                              className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
-                            >
-                              编辑
-                            </button>
-                            {!isSystemOwner(profile.userId) ? (
+                          {!isSystemSkillProfile(profile) ? (
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => router.push(`/skill-create?id=${profile.id}`)}
+                                className="rounded-lg border border-zinc-300 bg-white px-3 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                              >
+                                编辑
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => void handleDeleteSkillProfile(profile)}
@@ -1237,8 +1310,8 @@ export default function MyAgentPage() {
                               >
                                 删除
                               </button>
-                            ) : null}
-                          </div>
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     ))}
